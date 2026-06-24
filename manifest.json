@@ -4,6 +4,7 @@
   "requires": [],
   "optional": [],
   "js": "dist/index.js",
+  "generate_interceptor": "bbs_generateInterceptor",
   "author": "baibai",
   "version": "0.0.1",
   "homePage": "https://github.com/baibai-git/ST-BaiBai-Book",

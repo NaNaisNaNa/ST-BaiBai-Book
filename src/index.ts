@@ -1,5 +1,5 @@
 import { hydrateSettings } from '@/api/settings';
-import { bindEngine } from '@/memory/engine';
+import { bindEngine, handleGenerationIntercept } from '@/memory/engine';
 import { refreshInjection } from '@/memory/inject';
 import { bindChatLifecycle } from '@/memory/store';
 import App from '@/App.vue';
@@ -10,6 +10,24 @@ import '@/styles/theme.css';
 import { createApp } from 'vue';
 
 const HOST_ID = 'bbs-app-host';
+
+/**
+ * 生成拦截器:ST 在每次生成前会 await 调用 manifest.generate_interceptor 指名的全局函数,
+ * 签名 (chat, contextSize, abort, type),调 abort(true) 即中止本次生成。
+ * 这里委托给引擎判断「积压楼层过多」并按需拦截 + 插提示楼。挂在 globalThis 上供 ST 找到。
+ */
+(globalThis as Record<string, unknown>).bbs_generateInterceptor = async (
+  _chat: unknown,
+  _contextSize: number,
+  abort: (immediately: boolean) => void,
+  type: string | undefined,
+): Promise<void> => {
+  try {
+    await handleGenerationIntercept(type, abort);
+  } catch (e) {
+    console.error('[柏宝书] 生成拦截器异常(放行本次生成)', e);
+  }
+};
 
 /**
  * 可继承的排版属性——shadow DOM 不隔离继承,这些会透过 host 从 ST 漏进来。

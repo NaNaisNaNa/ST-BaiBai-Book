@@ -34,11 +34,35 @@ export interface CustomPrompts {
   jailbreak: string;
 }
 
+/** 单个向量模型的配置。channel 空=复用 embedding 的渠道;model 空=复用 embedding 的模型名。 */
+export interface VectorModelConfig {
+  /** 指派的渠道 id(取自 channels);空串=复用 embedding 的渠道 */
+  channel: string;
+  /** 模型名;空串=复用 embedding 的模型 */
+  model: string;
+}
+
+/** 向量记忆设置。embedding 为基准,rerank/queryRewrite 留空则整体复用 embedding。 */
+export interface VectorSettings {
+  /** 向量记忆开关 */
+  enabled: boolean;
+  /** 向量专用渠道列表(与副 API 的 channels 相互独立) */
+  channels: ApiChannel[];
+  /** 文本向量化模型(基准,其余两个可复用它) */
+  embedding: VectorModelConfig;
+  /** 重排模型;留空复用 embedding */
+  rerank: VectorModelConfig;
+  /** 查询重写模型;留空复用 embedding */
+  queryRewrite: VectorModelConfig;
+}
+
 export interface ApiSettings {
   /** 插件总开关。关闭后停止一切自动注入/摘要/总结/隐藏;ST 菜单入口仍在,可重新打开界面再开启。 */
   enabled: boolean;
   /** 自定义提示词模板(空=用内置) */
   prompts: CustomPrompts;
+  /** 向量记忆配置 */
+  vector: VectorSettings;
   channels: ApiChannel[];
   /** 各任务指派的渠道 id */
   assignments: Record<TaskType, string>;
@@ -48,6 +72,8 @@ export interface ApiSettings {
   keepRecent: number;
   /** 自动隐藏被摘要覆盖的消息 */
   autoHide: boolean;
+  /** 积压拦截:发消息前若有 >=2 个已滑出窗口却仍未摘的楼,拦截本次生成并提示去补摘 */
+  blockOnBacklog: boolean;
   /** 叶子摘要积累到 N 条时,压成一条 L1 总结(L0→L1 阈值,0=关闭) */
   leafBatchThreshold: number;
   /** L1 及以上每积累到 N 条时,压成上一层总结(L≥1→L+1 阈值,0=关闭) */
@@ -62,11 +88,19 @@ function defaults(): ApiSettings {
   return {
     enabled: true,
     prompts: { summary: '', resummary: '', jailbreak: '' },
+    vector: {
+      enabled: false,
+      channels: [],
+      embedding: { channel: '', model: '' },
+      rerank: { channel: '', model: '' },
+      queryRewrite: { channel: '', model: '' },
+    },
     channels: [],
     assignments: { summary: '', resummary: '' },
     autoSummaryEnabled: false,
     keepRecent: 5,
     autoHide: true,
+    blockOnBacklog: true,
     leafBatchThreshold: 12,
     resummaryThreshold: 7,
   };
@@ -79,6 +113,15 @@ function normalize(raw: unknown): ApiSettings {
   const merged = { ...d, ...(raw as Partial<ApiSettings>) };
   // prompts 是嵌套对象,展开合并不会补全缺字段,单独兜底(老数据没有 prompts 键时回退默认)
   merged.prompts = { ...d.prompts, ...((raw as Partial<ApiSettings>).prompts ?? {}) };
+  // vector 同为嵌套对象(且内含子对象),逐层兜底,老数据缺字段时回退默认
+  const rv = ((raw as Partial<ApiSettings>).vector ?? {}) as Partial<VectorSettings>;
+  merged.vector = {
+    ...d.vector,
+    ...rv,
+    embedding: { ...d.vector.embedding, ...(rv.embedding ?? {}) },
+    rerank: { ...d.vector.rerank, ...(rv.rerank ?? {}) },
+    queryRewrite: { ...d.vector.queryRewrite, ...(rv.queryRewrite ?? {}) },
+  };
   return merged;
 }
 
@@ -91,11 +134,13 @@ let ready = false;
 function applyInto(target: ApiSettings, src: ApiSettings): void {
   target.enabled = src.enabled;
   target.prompts = src.prompts;
+  target.vector = src.vector;
   target.channels = src.channels;
   target.assignments = src.assignments;
   target.autoSummaryEnabled = src.autoSummaryEnabled;
   target.keepRecent = src.keepRecent;
   target.autoHide = src.autoHide;
+  target.blockOnBacklog = src.blockOnBacklog;
   target.leafBatchThreshold = src.leafBatchThreshold;
   target.resummaryThreshold = src.resummaryThreshold;
 }
@@ -171,4 +216,22 @@ export function getChannelForTask(task: TaskType): ApiChannel | null {
   const id = apiSettings.assignments[task];
   if (!id) return null;
   return apiSettings.channels.find(c => c.id === id) ?? null;
+}
+
+/**
+ * 解析某个向量子任务实际使用的渠道与模型:rerank/queryRewrite 任一项留空就回落到 embedding。
+ * 返回 { channel, model };渠道可能为 null(没指派/找不到),交由调用方处理。
+ */
+export function resolveVectorModel(role: 'embedding' | 'rerank' | 'queryRewrite'): {
+  channel: ApiChannel | null;
+  model: string;
+} {
+  const v = apiSettings.vector;
+  const base = v.embedding;
+  const cfg = v[role];
+  const channelId = cfg.channel || base.channel;
+  const model = cfg.model || base.model;
+  // 渠道取自向量专用列表(与副 API 渠道独立)
+  const channel = channelId ? v.channels.find(c => c.id === channelId) ?? null : null;
+  return { channel, model };
 }

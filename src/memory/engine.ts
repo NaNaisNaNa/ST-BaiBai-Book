@@ -6,7 +6,7 @@ import { getContext } from '@/st/context';
 import { addSummary, deriveMemory, finalizeDelta, getLeaf, leafHash, leafValid, makeLeafId, pruneBrokenComps, stripHtml } from './apply';
 import { extractJsonObject } from './json';
 import { clearInjection, refreshInjection, renderHistoryNodes, selectHistoryNodesBefore } from './inject';
-import { buildResummaryPrompt, buildSummaryPrompt, buildWorldInfoSystem, THINKING_CHECKLIST, THINKING_PREFILL } from './prompts';
+import { buildResummaryPrompt, buildSummaryPrompt, buildWorldInfoSystem, JAILBREAK_PROMPT, THINKING_CHECKLIST, THINKING_PREFILL } from './prompts';
 import { memory, recomputeDerived, scheduleLeafFlush } from './store';
 import type { LeafExtra, SummaryDelta } from './types';
 
@@ -139,6 +139,64 @@ export function pendingAiFloors(chat: STMessage[]): number[] {
     if (isAiFloor(chat[i]) && !leafValid(chat[i])) out.push(i);
   }
   return out;
+}
+
+/**
+ * 「积压」楼层:已滑出保留窗口(< keepStart)、却仍没有有效叶子的 AI 楼。
+ * 这才是真正漏摘的部分——最近 keepRecent 条本就发全文、最后才摘,不算积压,
+ * 否则正常使用每轮都会有 1 条「最新待摘」而被误判。
+ */
+export function backlogFloors(chat: STMessage[]): number[] {
+  const keepStart = resolveKeepStart(chat);
+  return pendingAiFloors(chat).filter(i => i < keepStart);
+}
+
+// 提示楼正文里的固定句,既给用户看,也用作「末楼是否已是本提示楼」的去重哨兵
+const BACKLOG_NOTICE_SENTINEL = '本次生成已拦截';
+
+/**
+ * 生成拦截器:正常发消息前,若保留窗口外仍有未摘楼层(积压 >= 1)则中止本次生成,
+ * 并用 /sendas 插一条提示楼,引导用户去摘要页补摘。
+ * 只拦 type==='normal'(翻页/重生成/续写/安静生成都放行)。
+ * 尊重总开关与 blockOnBacklog 开关;返回是否已拦截。
+ */
+export async function handleGenerationIntercept(
+  type: string | undefined,
+  abort: (immediately: boolean) => void,
+): Promise<boolean> {
+  if (!apiSettings.enabled) return false;
+  if (!apiSettings.blockOnBacklog) return false;
+  if (type !== 'normal') return false; // 只拦真正的新消息生成
+
+  const ctx = getContext();
+  if (!ctx) return false;
+  const chat = ctx.chat ?? [];
+  const backlog = backlogFloors(chat);
+  if (backlog.length < 1) return false;
+
+  abort(true); // 立即中止,后续拦截器也不再跑
+
+  // 去重:末楼已是本提示楼就不再重复插(连点发送不刷屏)
+  const last = chat[chat.length - 1];
+  if (last && !last.is_user && typeof last.mes === 'string' && last.mes.includes(BACKLOG_NOTICE_SENTINEL)) {
+    return true;
+  }
+
+  const exec = ctx.executeSlashCommandsWithOptions;
+  if (typeof exec === 'function') {
+    // 多行靠 {{newline}} 宏(sendMessageAs 走 substituteParams 会还原成换行)
+    const text = [
+      '[柏宝书]',
+      `前面存在过多楼层未生成摘要(${backlog.length} 层),为保证剧情连续性,请先在柏宝书界面的摘要页里,点击未摘要楼层的楼层号进行生成摘要。`,
+      BACKLOG_NOTICE_SENTINEL,
+    ].join('{{newline}}');
+    try {
+      await exec(`/sendas name="柏宝书" ${text}`);
+    } catch (e) {
+      engineState.lastError = `积压提示楼插入失败: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+  return true;
 }
 
 /** 摘要后的统一收尾:同步滑动隐藏 + 刷新注入 */
@@ -399,9 +457,10 @@ export async function runSummary(aiFloor: number): Promise<void> {
       content,
     });
 
-    // 组装:破限(有才加,置顶)→ 世界设定(独立 system,有才加)→ 主提示 → 思考清单 → assistant 预填
+    // 组装:破限(置顶)→ 世界设定(独立 system,有才加)→ 主提示 → 思考清单 → assistant 预填。
+    // 破限留空=用内置默认(与摘要/总结提示词同一回退语义);确实不想要可在设置里删成默认后再清。
     const messages: ChatMsg[] = [];
-    const jb = apiSettings.prompts.jailbreak.trim();
+    const jb = apiSettings.prompts.jailbreak.trim() || JAILBREAK_PROMPT;
     if (jb) messages.push({ role: 'system', content: jb });
     if (worldInfo) messages.push({ role: 'system', content: buildWorldInfoSystem(worldInfo) });
     messages.push(
@@ -523,7 +582,7 @@ export async function checkResummary(): Promise<void> {
     const prompt = buildResummaryPrompt({ user: ctx.name1, char: ctx.name2, content });
 
     try {
-      const jb = apiSettings.prompts.jailbreak.trim();
+      const jb = apiSettings.prompts.jailbreak.trim() || JAILBREAK_PROMPT;
       const messages: ChatMsg[] = [];
       if (jb) messages.push({ role: 'system', content: jb });
       messages.push({ role: 'user', content: prompt });

@@ -4,6 +4,7 @@ import Icon from '@/components/Icon.vue';
 import { fetchModels, testChannel } from '@/api/client';
 import { apiSettings, newChannel, type ApiChannel } from '@/api/settings';
 import {
+  JAILBREAK_PROMPT,
   RESUMMARY_MACROS,
   RESUMMARY_PROMPT,
   SUMMARY_MACROS,
@@ -19,20 +20,31 @@ const navOptions: { value: NavPosition; label: string }[] = [
   { value: 'bottom', label: '底部' },
 ];
 
-/* —— 渠道:列表只读展示,编辑/新建都在弹窗里进行,避免一长列表单平铺误触 —— */
+/* —— 渠道:列表只读展示,编辑/新建都在弹窗里进行,避免一长列表平铺误触。
+   两套独立渠道:'api'=副 API(摘要/总结),'vector'=向量记忆。弹窗按 scope 操作对应列表。 —— */
+type ChannelScope = 'api' | 'vector';
 const editingId = ref<string | null>(null);
-const editingChannel = computed(() => apiSettings.channels.find(c => c.id === editingId.value) ?? null);
+const editingScope = ref<ChannelScope>('api');
+// 当前 scope 对应的渠道数组(增删/查找都走它)
+function channelsOf(scope: ChannelScope): ApiChannel[] {
+  return scope === 'vector' ? apiSettings.vector.channels : apiSettings.channels;
+}
+const editingChannel = computed(
+  () => channelsOf(editingScope.value).find(c => c.id === editingId.value) ?? null,
+);
 // 密钥默认隐藏;每次打开/关闭弹窗都复位,避免密钥意外保持明文
 const showKey = ref(false);
 
-function addChannel() {
+function addChannel(scope: ChannelScope = 'api') {
   const ch = newChannel();
-  apiSettings.channels.push(ch);
+  channelsOf(scope).push(ch);
   showKey.value = false;
+  editingScope.value = scope;
   editingId.value = ch.id; // 新建即进入编辑弹窗
 }
-function openChannel(id: string) {
+function openChannel(id: string, scope: ChannelScope = 'api') {
   showKey.value = false;
+  editingScope.value = scope;
   editingId.value = id;
 }
 function closeChannel() {
@@ -40,11 +52,19 @@ function closeChannel() {
   editingId.value = null;
 }
 function removeChannel(id: string) {
-  const idx = apiSettings.channels.findIndex(c => c.id === id);
-  if (idx >= 0) apiSettings.channels.splice(idx, 1);
-  // 清理指派
-  if (apiSettings.assignments.summary === id) apiSettings.assignments.summary = '';
-  if (apiSettings.assignments.resummary === id) apiSettings.assignments.resummary = '';
+  const scope = editingScope.value;
+  const list = channelsOf(scope);
+  const idx = list.findIndex(c => c.id === id);
+  if (idx >= 0) list.splice(idx, 1);
+  // 清理指派:副 API 清两类摘要指派;向量清三个角色里引用到的渠道
+  if (scope === 'api') {
+    if (apiSettings.assignments.summary === id) apiSettings.assignments.summary = '';
+    if (apiSettings.assignments.resummary === id) apiSettings.assignments.resummary = '';
+  } else {
+    for (const role of ['embedding', 'rerank', 'queryRewrite'] as const) {
+      if (apiSettings.vector[role].channel === id) apiSettings.vector[role].channel = '';
+    }
+  }
   if (editingId.value === id) editingId.value = null;
 }
 
@@ -100,8 +120,8 @@ const PROMPT_METAS: PromptMeta[] = [
   {
     key: 'jailbreak',
     label: '破限提示词',
-    hint: '附加在摘要/总结请求里的破限内容。留空则不附加。',
-    builtin: '',
+    hint: '作为置顶 system 附加在摘要/总结请求里,降低副 API 拒答率。留空则用内置默认。',
+    builtin: JAILBREAK_PROMPT,
     macros: [],
   },
 ];
@@ -137,6 +157,18 @@ function savePrompt() {
 function resetPrompt() {
   if (editingPrompt.value) promptDraft.value = editingPrompt.value.builtin;
 }
+
+/* —— 向量记忆:三个模型角色,embedding 为基准,后两者留空复用它 —— */
+type VectorRole = 'embedding' | 'rerank' | 'queryRewrite';
+interface VectorRoleMeta {
+  key: VectorRole;
+  label: string;
+}
+const VECTOR_ROLES: VectorRoleMeta[] = [
+  { key: 'embedding', label: 'Embedding 模型' },
+  { key: 'rerank', label: 'Rerank 模型' },
+  { key: 'queryRewrite', label: 'Query 重写模型' },
+];
 
 // 点宏标签 → 插入到文本框光标处(无焦点则追加到末尾)
 function insertMacro(token: string) {
@@ -248,7 +280,7 @@ function insertMacro(token: string) {
         <!-- 渠道:顶部添加按钮 + 紧凑只读列表(点行进弹窗编辑),不再一长列表单平铺 -->
         <div class="bbs-channel-bar">
           <span class="bbs-field-label">渠道</span>
-          <button class="bbs-btn bbs-btn-primary bbs-btn-sm" type="button" @click="addChannel">
+          <button class="bbs-btn bbs-btn-primary bbs-btn-sm" type="button" @click="addChannel('api')">
             <Icon name="plus" /> 添加渠道
           </button>
         </div>
@@ -275,6 +307,11 @@ function insertMacro(token: string) {
           <input v-model="apiSettings.autoHide" type="checkbox" class="bbs-checkbox" />
         </label>
         <p class="bbs-field-hint">关闭后仅生成摘要、不隐藏原文(原文与摘要会重复占用上下文)。</p>
+        <label class="bbs-switch-row">
+          <span class="bbs-field-label">积压过多时拦截发送</span>
+          <input v-model="apiSettings.blockOnBacklog" type="checkbox" class="bbs-checkbox" />
+        </label>
+        <p class="bbs-field-hint">发消息前若保留窗口外仍有「已滑出窗口却仍未摘要」的楼层(哪怕只有 1 层),拦截本次生成并插一条提示楼,引导先去补摘,避免漏摘导致剧情断层。</p>
         <label class="bbs-num-row">
           <span class="bbs-field-label">保留最近 AI 消息数</span>
           <input v-model.number="apiSettings.keepRecent" class="bbs-input bbs-num" type="number" min="0" />
@@ -307,9 +344,68 @@ function insertMacro(token: string) {
         </ul>
       </Collapsible>
 
-      <!-- 向量记忆(待填充) -->
+      <!-- 向量记忆 -->
       <Collapsible title="向量记忆" :open="false">
-        <p class="bbs-field-hint">即将开放。</p>
+        <label class="bbs-switch-row">
+          <span class="bbs-field-label">启用向量记忆</span>
+          <input v-model="apiSettings.vector.enabled" type="checkbox" class="bbs-checkbox" />
+        </label>
+
+        <hr class="bbs-rule" />
+
+        <!-- 向量专用渠道(独立于副 API):顶部添加 + 紧凑列表 -->
+        <div class="bbs-channel-bar">
+          <span class="bbs-field-label">向量渠道</span>
+          <button class="bbs-btn bbs-btn-primary bbs-btn-sm" type="button" @click="addChannel('vector')">
+            <Icon name="plus" /> 添加渠道
+          </button>
+        </div>
+        <ul v-if="apiSettings.vector.channels.length" class="bbs-channel-list">
+          <li v-for="ch in apiSettings.vector.channels" :key="ch.id" class="bbs-channel-item">
+            <button class="bbs-channel-open" type="button" @click="openChannel(ch.id, 'vector')">
+              <span class="bbs-channel-item-name">{{ ch.name || '未命名渠道' }}</span>
+              <span class="bbs-channel-item-model">{{ ch.model || '未设模型' }}</span>
+            </button>
+          </li>
+        </ul>
+        <p v-else class="bbs-field-hint">还没有向量渠道。点「添加渠道」配置 Embedding/Rerank 等要用的 API。</p>
+
+        <hr class="bbs-rule" />
+
+        <!-- 模型配置:每个角色一组(渠道 + 模型名);rerank/query 留空复用 embedding -->
+        <div
+          v-for="role in VECTOR_ROLES"
+          :key="role.key"
+          class="bbs-vec-model"
+          :class="{ 'is-disabled': !apiSettings.vector.enabled }"
+        >
+          <div class="bbs-vec-head">
+            <span class="bbs-field-label">{{ role.label }}</span>
+          </div>
+          <div class="bbs-vec-grid">
+            <label class="bbs-vec-cell">
+              <span class="bbs-vec-cell-label">渠道</span>
+              <select
+                v-model="apiSettings.vector[role.key].channel"
+                class="bbs-input bbs-select bbs-vec-select"
+                :disabled="!apiSettings.vector.enabled"
+              >
+                <option value="">{{ role.key === 'embedding' ? '— 未指派 —' : '— 复用 Embedding —' }}</option>
+                <option v-for="c in apiSettings.vector.channels" :key="c.id" :value="c.id">{{ c.name }}</option>
+              </select>
+            </label>
+            <label class="bbs-vec-cell">
+              <span class="bbs-vec-cell-label">模型名</span>
+              <input
+                v-model="apiSettings.vector[role.key].model"
+                class="bbs-input bbs-vec-input"
+                type="text"
+                :placeholder="role.key === 'embedding' ? '如 text-embedding-3-small' : '留空复用 Embedding'"
+                :disabled="!apiSettings.vector.enabled"
+              />
+            </label>
+          </div>
+        </div>
       </Collapsible>
     </div>
 
@@ -763,6 +859,43 @@ function insertMacro(token: string) {
   transform: translateX(20px);
 }
 
+/* —— 向量记忆:每个模型角色一组卡片(渠道 + 模型名两列) —— */
+.bbs-vec-model {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--bbs-line);
+  border-radius: var(--bbs-radius);
+  background: var(--bbs-surface-2);
+  transition: opacity var(--bbs-dur) var(--bbs-ease);
+}
+.bbs-vec-model.is-disabled {
+  opacity: 0.5;
+}
+.bbs-vec-head {
+  margin-bottom: 10px;
+}
+.bbs-vec-grid {
+  display: flex;
+  gap: 10px;
+}
+.bbs-vec-cell {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.bbs-vec-cell-label {
+  font-size: 11px;
+  color: var(--bbs-ink-muted);
+}
+/* 这两列里的下拉/输入撑满各自单元格,覆盖 .bbs-select 的 60% 上限 */
+.bbs-vec-select,
+.bbs-vec-input {
+  max-width: none;
+  width: 100%;
+}
+
 /* —— 自定义提示词列表 —— */
 .bbs-prompt-list {
   list-style: none;
@@ -795,7 +928,7 @@ function insertMacro(token: string) {
 .bbs-prompt-name {
   flex: 1 1 auto;
   min-width: 0;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
 }
 /* 状态药丸:默认 muted,已自定义转金强调 */
@@ -870,9 +1003,11 @@ function insertMacro(token: string) {
 /* ============ 移动端:折叠区内部正文整体收一号,与窄屏标题节奏统一 ============ */
 @media (max-width: 640px) {
   .bbs-field-label,
-  .bbs-channel-item-name,
-  .bbs-prompt-name {
+  .bbs-channel-item-name {
     font-size: 13px;
+  }
+  .bbs-prompt-name {
+    font-size: 12px;
   }
   .bbs-field-hint,
   .bbs-channel-item-model {
@@ -880,6 +1015,13 @@ function insertMacro(token: string) {
   }
   .bbs-seg {
     font-size: 12px;
+  }
+  /* 向量模型两列在窄屏堆叠成两行,下拉/输入不再挤成一团 */
+  .bbs-vec-grid {
+    flex-direction: column;
+  }
+  .bbs-vec-cell-label {
+    font-size: 10.5px;
   }
 }
 </style>
