@@ -10,6 +10,20 @@ export function extractJsonObject<T = unknown>(raw: string): T | null {
   // 去掉 <think>…</think> / <thinking>…</thinking> 思维链(大小写不敏感)
   s = s.replace(/<think(?:ing)?\b[\s\S]*?<\/think(?:ing)?>/gi, '').trim();
 
+  // assistant prefill 场景下,返回可能只包含续写的思维链正文 + </thinking> + JSON,
+  // 没有开头 <thinking>。此时丢弃最后一个闭合标签及其之前的全部文本。
+  const danglingThinkClose = s.match(/<\/think(?:ing)?>/gi);
+  if (danglingThinkClose) {
+    const lastClose = Math.max(
+      s.toLowerCase().lastIndexOf('</think>'),
+      s.toLowerCase().lastIndexOf('</thinking>'),
+    );
+    if (lastClose >= 0) {
+      const close = s.slice(lastClose).match(/^<\/think(?:ing)?>/i)?.[0] ?? '';
+      s = s.slice(lastClose + close.length).trim();
+    }
+  }
+
   // 去掉 ```json ... ``` / ``` ... ``` 围栏
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) s = fence[1].trim();

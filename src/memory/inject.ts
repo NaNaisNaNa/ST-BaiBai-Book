@@ -31,7 +31,8 @@ const HISTORY_INJECT_KEY = 'baibai_book_memory_history';
 const STATE_INJECT_KEY = 'baibai_book_memory_state';
 /** 历史摘要尽量放到聊天上下文顶部;当前状态贴近最近对话 */
 const HISTORY_INJECT_DEPTH = 9999;
-const STATE_INJECT_DEPTH = 2;
+const STATE_INJECT_DEPTH_AFTER_LATEST_AI = 1;
+const STATE_INJECT_DEPTH_BEFORE_LATEST_AI = 2;
 
 /**
  * 一条叶子是否「已启用」(应注入)。
@@ -41,6 +42,28 @@ const STATE_INJECT_DEPTH = 2;
 function leafActiveAt(chat: STMessage[] | null, i: number): boolean {
   if (!chat) return false;
   return chat[i]?.is_system === true;
+}
+
+/** 用于决定状态快照相对最新 AI 楼的位置;与 engine.ts 的可追踪 AI 楼规则保持一致。 */
+function isTrackableAiMessage(m: STMessage | undefined): boolean {
+  if (!m || m.is_user) return false;
+  if (typeof m.mes !== 'string' || !m.mes.trim()) return false;
+  if (m.extra?.bbs_hidden) return true;
+  return !m.is_system;
+}
+
+/**
+ * 当前状态的注入位置:
+ *  - 最新 AI 已有有效摘要 → 状态已包含它,放在它之后(D1)。
+ *  - 最新 AI 尚无有效摘要 → 状态不包含它,保持放在它之前(D2)。
+ */
+function resolveStateInjectionDepth(chat: STMessage[] | null): number {
+  if (!chat) return STATE_INJECT_DEPTH_BEFORE_LATEST_AI;
+  for (let i = chat.length - 1; i >= 0; i--) {
+    if (!isTrackableAiMessage(chat[i])) continue;
+    return leafValid(chat[i]) ? STATE_INJECT_DEPTH_AFTER_LATEST_AI : STATE_INJECT_DEPTH_BEFORE_LATEST_AI;
+  }
+  return STATE_INJECT_DEPTH_BEFORE_LATEST_AI;
 }
 
 /** 统一视图节点:叶子来自 chat 扫描,压缩节点来自森林,childIds 跨存储连接 */
@@ -220,15 +243,17 @@ export function refreshInjection(): void {
   const ctx = getContext();
   const fn = ctx?.setExtensionPrompt;
   if (typeof fn !== 'function') return;
-  fn(LEGACY_INJECT_KEY, '', IN_CHAT, STATE_INJECT_DEPTH, false, ROLE_SYSTEM, null);
+  const stateDepth = resolveStateInjectionDepth(ctx.chat ?? null);
+  fn(LEGACY_INJECT_KEY, '', IN_CHAT, STATE_INJECT_DEPTH_BEFORE_LATEST_AI, false, ROLE_SYSTEM, null);
   fn(HISTORY_INJECT_KEY, buildHistoryInjectionText(), IN_CHAT, HISTORY_INJECT_DEPTH, false, ROLE_SYSTEM, null);
-  fn(STATE_INJECT_KEY, buildStateInjectionText(), IN_CHAT, STATE_INJECT_DEPTH, false, ROLE_SYSTEM, null);
+  fn(STATE_INJECT_KEY, buildStateInjectionText(), IN_CHAT, stateDepth, false, ROLE_SYSTEM, null);
 }
 
 /** 清除注入(注入空串)。切到无记忆的聊天时由 refreshInjection 自动完成,此处供显式调用。 */
 export function clearInjection(): void {
   const ctx = getContext();
-  ctx?.setExtensionPrompt?.(LEGACY_INJECT_KEY, '', IN_CHAT, STATE_INJECT_DEPTH, false, ROLE_SYSTEM, null);
+  const stateDepth = resolveStateInjectionDepth(ctx?.chat ?? null);
+  ctx?.setExtensionPrompt?.(LEGACY_INJECT_KEY, '', IN_CHAT, STATE_INJECT_DEPTH_BEFORE_LATEST_AI, false, ROLE_SYSTEM, null);
   ctx?.setExtensionPrompt?.(HISTORY_INJECT_KEY, '', IN_CHAT, HISTORY_INJECT_DEPTH, false, ROLE_SYSTEM, null);
-  ctx?.setExtensionPrompt?.(STATE_INJECT_KEY, '', IN_CHAT, STATE_INJECT_DEPTH, false, ROLE_SYSTEM, null);
+  ctx?.setExtensionPrompt?.(STATE_INJECT_KEY, '', IN_CHAT, stateDepth, false, ROLE_SYSTEM, null);
 }

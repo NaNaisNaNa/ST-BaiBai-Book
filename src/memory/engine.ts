@@ -138,10 +138,10 @@ export function pendingAiFloors(chat: STMessage[]): number[] {
   return out;
 }
 
-/** 摘要后的统一收尾:滑动隐藏 + 刷新注入 */
+/** 摘要后的统一收尾:同步滑动隐藏 + 刷新注入 */
 async function afterSummaryHideAndInject(chat: STMessage[]): Promise<void> {
   if (apiSettings.autoHide) {
-    await applyWindowHide(chat);
+    await syncWindowHiddenState(chat);
   }
   refreshInjection();
 }
@@ -230,34 +230,65 @@ export function coalesceRanges(indices: number[]): Array<[number, number]> {
 }
 
 /**
- * 隐藏「保留窗口之前、已被摘要覆盖、尚未隐藏」的消息。
+ * 同步滑动窗口隐藏状态:
+ *  - 隐藏「保留窗口之前、已被摘要覆盖、尚未隐藏」的消息。
+ *  - 取消隐藏「曾由本插件隐藏、但现在不应隐藏」的消息。
  * 走 ST 原生 /hide(对齐 Horae、自动同步 DOM、走官方入口),
- * 同时打 extra.bbs_hidden 私有标记区分「我们隐藏的」与「ST 原生系统楼」。
+ * /unhide,同时用 extra.bbs_hidden 私有标记区分「我们隐藏的」与「ST 原生系统楼」。
  * 只隐藏已被摘要覆盖的,绝不制造信息黑洞。
  */
-async function applyWindowHide(chat: STMessage[]): Promise<void> {
+async function syncWindowHiddenState(chat: STMessage[]): Promise<void> {
   const keepStart = resolveKeepStart(chat);
-  if (keepStart <= 0) return;
   const covered = coveredSet(chat);
   const ctx = getContext();
   if (!ctx) return;
 
   const toHide: number[] = [];
-  for (let i = 0; i < keepStart; i++) {
+  const toUnhide: number[] = [];
+  for (let i = 0; i < chat.length; i++) {
     const m = chat[i];
-    if (!m || !covered.has(i)) continue;
-    if (m.extra?.bbs_hidden) continue;
-    // 预写私有标记 + 内存态,防止 /hide 异步期间的竞态 saveChat 覆盖
-    m.extra = { ...(m.extra ?? {}), bbs_hidden: true };
-    toHide.push(i);
+    if (!m) continue;
+    const shouldHide = i < keepStart && covered.has(i);
+    if (shouldHide) {
+      if (!m.extra?.bbs_hidden || m.is_system !== true) toHide.push(i);
+    } else if (m.extra?.bbs_hidden) {
+      toUnhide.push(i);
+    }
   }
-  if (toHide.length === 0) return;
+  if (toHide.length === 0 && toUnhide.length === 0) return;
 
   const exec = ctx.executeSlashCommandsWithOptions;
   if (typeof exec === 'function') {
+    for (const [start, end] of coalesceRanges(toUnhide)) {
+      const arg = start === end ? `${start}` : `${start}-${end}`;
+      try {
+        for (let i = start; i <= end; i++) {
+          const m = chat[i];
+          if (!m?.extra?.bbs_hidden) continue;
+          const { bbs_hidden: _hidden, ...extra } = m.extra;
+          m.extra = extra;
+        }
+        await exec(`/unhide ${arg}`);
+      } catch (e) {
+        // /unhide 失败则回退到直接写 is_system,保证取消隐藏一定落地
+        for (let i = start; i <= end; i++) {
+          const m = chat[i];
+          if (!m) continue;
+          m.is_system = false;
+          if (m.extra?.bbs_hidden) {
+            const { bbs_hidden: _hidden, ...extra } = m.extra;
+            m.extra = extra;
+          }
+        }
+        engineState.lastError = `/unhide ${arg} 失败: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+
     for (const [start, end] of coalesceRanges(toHide)) {
       const arg = start === end ? `${start}` : `${start}-${end}`;
       try {
+        // 预写私有标记 + 内存态,防止 /hide 异步期间的竞态 saveChat 覆盖
+        for (let i = start; i <= end; i++) if (chat[i]) chat[i].extra = { ...(chat[i].extra ?? {}), bbs_hidden: true };
         await exec(`/hide ${arg}`);
       } catch (e) {
         // /hide 失败则回退到直接写 is_system,保证隐藏一定落地
@@ -267,7 +298,21 @@ async function applyWindowHide(chat: STMessage[]): Promise<void> {
     }
   } else {
     // 无 slash 执行器(旧版/未就绪):回退直接写 is_system + 重载
-    for (const i of toHide) if (chat[i]) chat[i].is_system = true;
+    for (const i of toUnhide) {
+      const m = chat[i];
+      if (!m) continue;
+      m.is_system = false;
+      if (m.extra?.bbs_hidden) {
+        const { bbs_hidden: _hidden, ...extra } = m.extra;
+        m.extra = extra;
+      }
+    }
+    for (const i of toHide) {
+      const m = chat[i];
+      if (!m) continue;
+      m.extra = { ...(m.extra ?? {}), bbs_hidden: true };
+      m.is_system = true;
+    }
     try {
       await ctx.saveChat();
       await ctx.reloadCurrentChat();
@@ -362,7 +407,7 @@ export async function runSummary(aiFloor: number): Promise<void> {
 
     engineState.lastRunAt = Date.now();
 
-    // 立刻反映到派生与注入;落盘走防抖(隐藏由 checkAutoSummary 末尾的 applyWindowHide 统一负责)
+    // 立刻反映到派生与注入;落盘走防抖(隐藏由收尾的 syncWindowHiddenState 统一负责)
     recomputeDerived();
     refreshInjection();
     scheduleLeafFlush();
@@ -482,12 +527,20 @@ export async function checkResummary(): Promise<void> {
  * debounce 合并快速连翻。
  */
 let reactTimer: ReturnType<typeof setTimeout> | null = null;
-function reactToChatMutation(): void {
+function reactToChatMutation(syncHidden = false): void {
   if (reactTimer) clearTimeout(reactTimer);
   reactTimer = setTimeout(() => {
     reactTimer = null;
     pruneBrokenComps(); // 叶子失效 → 删包含它的整条祖先压缩链
     recomputeDerived(); // 删叶/陈旧 → 物品/计划回退;UI(derivedMeta)更新
+    if (syncHidden && apiSettings.autoHide) {
+      void syncWindowHiddenState(getContext()?.chat ?? [])
+        .catch(e => {
+          engineState.lastError = e instanceof Error ? e.message : String(e);
+        })
+        .finally(() => refreshInjection());
+      return;
+    }
     refreshInjection(); // 不再注入陈旧/已删叶子
   }, 200);
 }
@@ -497,7 +550,8 @@ function reactToChatMutation(): void {
  * 进入聊天 / 翻到没摘要的页,都不再自动立刻补摘。
  *  - USER_MESSAGE_RENDERED:发新消息 → 摘「上一条 AI」(skipLastAi=false)。
  *  - GENERATION_STARTED(regenerate/swipe):末尾 AI 正在被改写,跳过它 → 摘「之前那条 AI」(skipLastAi=true)。
- *  - MESSAGE_SWIPED / MESSAGE_EDITED / MESSAGE_DELETED:数据随消息跟随 → reactToChatMutation(清坏链+重算+刷新),不在此处生成。
+ *  - MESSAGE_SWIPED / MESSAGE_EDITED:数据随消息跟随 → reactToChatMutation(清坏链+重算+刷新),不在此处生成。
+ *  - MESSAGE_DELETED:同上,并同步一次滑动隐藏/取消隐藏。
  *  - CHAT_CHANGED:store 负责重载,这里刷新注入。
  */
 export function bindEngine(): void {
@@ -527,7 +581,7 @@ export function bindEngine(): void {
   // 以下三事件只让数据/UI 跟随,不主动生成摘要。
   if (et.MESSAGE_SWIPED) es.on(et.MESSAGE_SWIPED, () => reactToChatMutation());
   if (et.MESSAGE_EDITED) es.on(et.MESSAGE_EDITED, () => reactToChatMutation());
-  if (et.MESSAGE_DELETED) es.on(et.MESSAGE_DELETED, () => reactToChatMutation());
+  if (et.MESSAGE_DELETED) es.on(et.MESSAGE_DELETED, () => reactToChatMutation(true));
 
   if (et.CHAT_CHANGED) {
     es.on(et.CHAT_CHANGED, () => {
