@@ -334,6 +334,18 @@ export function editLeafAt(index: number, text: string, time: string): boolean {
   return true;
 }
 
+/**
+ * 编辑一个压缩节点(总结)的正文。总结只压文本、不含结构化数据,
+ * 故只改 text 字段即可,无需 recompute。
+ */
+export function editSummary(id: string, text: string): boolean {
+  const comp = memory.summaries.find(s => s.id === id);
+  if (!comp) return false;
+  comp.text = text.trim();
+  saveMemory();
+  return true;
+}
+
 /* ============ 删除 / 拆封 ============ */
 
 /**

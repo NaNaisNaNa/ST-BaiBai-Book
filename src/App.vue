@@ -211,8 +211,8 @@ const windowStyle = computed(() => {
 .bbs-page-enter-active,
 .bbs-page-leave-active {
   transition:
-    opacity 0.2s var(--bbs-ease),
-    transform 0.2s var(--bbs-ease);
+    opacity 0.13s var(--bbs-ease),
+    transform 0.13s var(--bbs-ease);
 }
 .bbs-page-enter-from {
   opacity: 0;

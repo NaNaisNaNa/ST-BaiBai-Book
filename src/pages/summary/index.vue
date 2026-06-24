@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import Icon from '@/components/Icon.vue';
-import { appendOpToLatestLeaf, deleteLeafAt, deleteSummary, editLeafAt } from '@/memory/apply';
+import { appendOpToLatestLeaf, deleteLeafAt, deleteSummary, editLeafAt, editSummary } from '@/memory/apply';
 import { checkAutoSummary, engineState } from '@/memory/engine';
 import { refreshInjection } from '@/memory/inject';
 import { derivedMeta, memory } from '@/memory/store';
@@ -149,19 +149,28 @@ function onDelete(r: Row) {
   refreshInjection();
 }
 
-/* ============ 编辑弹窗(仅叶子可编辑)============ */
-const editing = ref<{ msgIndex: number; text: string; time: string } | null>(null);
+/* ============ 编辑弹窗 ============
+ * 叶子:可改「故事内时间」+ 正文;总结:只压文本,故只改正文。 */
+type Editing =
+  | { kind: 'leaf'; msgIndex: number; text: string; time: string }
+  | { kind: 'comp'; compId: string; level: number; text: string };
+const editing = ref<Editing | null>(null);
 
 function openEdit(r: Row) {
-  if (r.kind !== 'leaf' || typeof r.msgIndex !== 'number') return;
-  editing.value = { msgIndex: r.msgIndex, text: r.text, time: r.timeLabel ?? '' };
+  if (r.kind === 'leaf' && typeof r.msgIndex === 'number') {
+    editing.value = { kind: 'leaf', msgIndex: r.msgIndex, text: r.text, time: r.timeLabel ?? '' };
+  } else if (r.kind === 'comp') {
+    editing.value = { kind: 'comp', compId: r.key.slice('comp:'.length), level: r.level, text: r.text };
+  }
 }
 function cancelEdit() {
   editing.value = null;
 }
 function saveEdit() {
-  if (!editing.value) return;
-  editLeafAt(editing.value.msgIndex, editing.value.text, editing.value.time);
+  const e = editing.value;
+  if (!e) return;
+  if (e.kind === 'leaf') editLeafAt(e.msgIndex, e.text, e.time);
+  else editSummary(e.compId, e.text);
   refreshInjection();
   editing.value = null;
 }
@@ -265,10 +274,9 @@ function saveEdit() {
           <span v-if="r.stale" class="bbs-summary-stale">待更新</span>
           <span class="bbs-summary-acts">
             <button
-              v-if="r.kind === 'leaf'"
               class="bbs-summary-act"
               type="button"
-              title="编辑摘要"
+              :title="r.kind === 'comp' ? '编辑总结' : '编辑摘要'"
               @click="openEdit(r)"
             >
               <Icon name="edit" />
@@ -297,17 +305,20 @@ function saveEdit() {
          内的 .bbs-root 上),导致弹窗无样式、被遮罩盖住(PC)甚至完全不可见(移动端)。
          弹窗本身 position:fixed,直接内联渲染即可覆盖全窗,且样式/变量都正常生效。 -->
     <div v-if="editing" class="bbs-modal-mask" @click.self="cancelEdit">
-      <div class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑摘要">
+      <div class="bbs-modal" role="dialog" aria-modal="true" :aria-label="editing.kind === 'comp' ? '编辑总结' : '编辑摘要'">
         <header class="bbs-modal-head">
-          <span class="bbs-modal-title">编辑摘要 · 楼层 #{{ editing.msgIndex }}</span>
+          <span class="bbs-modal-title">
+            {{ editing.kind === 'comp' ? `编辑${levelLabel(editing.level)}` : `编辑摘要 · 楼层 #${editing.msgIndex}` }}
+          </span>
           <button class="bbs-summary-act" type="button" title="关闭" @click="cancelEdit"><Icon name="close" /></button>
         </header>
-        <label class="bbs-modal-field">
+        <!-- 时间仅叶子可编辑;总结只压文本,无时间字段 -->
+        <label v-if="editing.kind === 'leaf'" class="bbs-modal-field">
           <span class="bbs-modal-label">故事内时间</span>
           <input v-model="editing.time" class="bbs-input" type="text" placeholder="如 1988/9/29 21:00" />
         </label>
         <label class="bbs-modal-field">
-          <span class="bbs-modal-label">摘要正文</span>
+          <span class="bbs-modal-label">{{ editing.kind === 'comp' ? '总结正文' : '摘要正文' }}</span>
           <textarea v-model="editing.text" class="bbs-input bbs-modal-textarea" rows="8"></textarea>
         </label>
         <footer class="bbs-modal-foot">
