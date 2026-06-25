@@ -34,7 +34,10 @@ export const derivedMeta = reactive<{ hasLeaf: boolean; leaves: LeafView[]; pend
 
 /** 重放 chat 得到 state/items/plans,原地写回;并刷新 derivedMeta */
 export function recomputeDerived(): void {
-  const chat = getContext()?.chat ?? null;
+  const ctx = getContext();
+  // 欢迎页(未进入任何聊天)getCurrentChatId 为空,但 chat 里可能残留上次的 #0,
+  // 不属于任何聊天的楼层不该被判为「未摘要」,故此时视作无 chat。
+  const chat = ctx?.getCurrentChatId?.() ? ctx.chat ?? null : null;
   const d = deriveMemory(chat);
   memory.state.time = d.state.time;
   memory.state.location = d.state.location;

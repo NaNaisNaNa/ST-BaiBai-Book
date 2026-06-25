@@ -74,6 +74,8 @@ export interface ApiSettings {
   autoHide: boolean;
   /** 积压拦截:发消息前若有 >=2 个已滑出窗口却仍未摘的楼,拦截本次生成并提示去补摘 */
   blockOnBacklog: boolean;
+  /** 排除的角色名:这些名字(含重名卡)的聊天里,记忆系统所有功能都不生效 */
+  excludedChars: string[];
   /** 叶子摘要积累到 N 条时,压成一条 L1 总结(L0→L1 阈值,0=关闭) */
   leafBatchThreshold: number;
   /** L1 及以上每积累到 N 条时,压成上一层总结(L≥1→L+1 阈值,0=关闭) */
@@ -101,6 +103,7 @@ function defaults(): ApiSettings {
     keepRecent: 5,
     autoHide: true,
     blockOnBacklog: true,
+    excludedChars: [],
     leafBatchThreshold: 12,
     resummaryThreshold: 7,
   };
@@ -113,6 +116,10 @@ function normalize(raw: unknown): ApiSettings {
   const merged = { ...d, ...(raw as Partial<ApiSettings>) };
   // prompts 是嵌套对象,展开合并不会补全缺字段,单独兜底(老数据没有 prompts 键时回退默认)
   merged.prompts = { ...d.prompts, ...((raw as Partial<ApiSettings>).prompts ?? {}) };
+  // excludedChars 必须是字符串数组,旧值类型不符时回退空数组
+  merged.excludedChars = Array.isArray(merged.excludedChars)
+    ? merged.excludedChars.filter((x): x is string => typeof x === 'string')
+    : [];
   // vector 同为嵌套对象(且内含子对象),逐层兜底,老数据缺字段时回退默认
   const rv = ((raw as Partial<ApiSettings>).vector ?? {}) as Partial<VectorSettings>;
   merged.vector = {
@@ -141,6 +148,7 @@ function applyInto(target: ApiSettings, src: ApiSettings): void {
   target.keepRecent = src.keepRecent;
   target.autoHide = src.autoHide;
   target.blockOnBacklog = src.blockOnBacklog;
+  target.excludedChars = src.excludedChars;
   target.leafBatchThreshold = src.leafBatchThreshold;
   target.resummaryThreshold = src.resummaryThreshold;
 }
@@ -210,6 +218,32 @@ export function newChannel(): ApiChannel {
     temperature: 0.7,
     maxTokens: 4096,
   };
+}
+
+/** 当前单角色聊天的角色名;群聊或未进入聊天时返回 null(群聊不参与排除)。 */
+export function currentCharName(): string | null {
+  const ctx = getContext();
+  if (!ctx) return null;
+  if (ctx.groupId) return null; // 群聊:多角色,不按单名排除
+  const idx = ctx.characterId;
+  if (idx === undefined || idx === null || idx === '') return null;
+  const ch = ctx.characters?.[Number(idx)];
+  return ch?.name ?? null;
+}
+
+/**
+ * 当前聊天是否被排除(该角色名在排除名单里)。被排除则记忆系统所有功能停用。
+ * 按「名字」匹配:同名的重名卡会被一并排除——符合用户「这批重名卡一起排除」的诉求。
+ */
+export function isCurrentChatExcluded(): boolean {
+  if (!apiSettings.excludedChars.length) return false;
+  const name = currentCharName();
+  return name !== null && apiSettings.excludedChars.includes(name);
+}
+
+/** 引擎是否在当前聊天生效:总开关开着且当前角色未被排除。各功能闸门统一走它。 */
+export function engineActiveHere(): boolean {
+  return apiSettings.enabled && !isCurrentChatExcluded();
 }
 
 export function getChannelForTask(task: TaskType): ApiChannel | null {

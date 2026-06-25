@@ -31,11 +31,24 @@ export interface STEventTypes {
   [k: string]: string;
 }
 
+/** 角色卡(只用到极少字段;avatar 是稳定唯一键,name 可能重名) */
+export interface STCharacter {
+  name: string;
+  avatar: string;
+  [k: string]: unknown;
+}
+
 export interface STContext {
   chat: STMessage[];
   chatMetadata: Record<string, unknown>;
   name1: string;
   name2: string;
+  /** 已加载的全部角色卡 */
+  characters?: STCharacter[];
+  /** 当前角色在 characters 中的索引(字符串/数字);群聊时为空 */
+  characterId?: string | number;
+  /** 当前群组 id;非群聊为空 */
+  groupId?: string;
   getCurrentChatId: () => string | undefined;
   getRequestHeaders: () => Record<string, string>;
   saveMetadataDebounced: () => void;

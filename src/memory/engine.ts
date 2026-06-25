@@ -1,6 +1,6 @@
 import type { ChatMsg } from '@/api/client';
 import { requestCompletion } from '@/api/client';
-import { apiSettings, getChannelForTask } from '@/api/settings';
+import { apiSettings, engineActiveHere, getChannelForTask } from '@/api/settings';
 import type { STMessage } from '@/st/context';
 import { getContext } from '@/st/context';
 import { addSummary, deriveMemory, finalizeDelta, getLeaf, leafHash, leafValid, makeLeafId, pruneBrokenComps, stripHtml } from './apply';
@@ -170,6 +170,7 @@ export async function handleGenerationIntercept(
 
   const ctx = getContext();
   if (!ctx) return false;
+  if (!ctx.getCurrentChatId?.()) return false; // 欢迎页:无聊天不拦
   const chat = ctx.chat ?? [];
   const backlog = backlogFloors(chat);
   if (backlog.length < 1) return false;
