@@ -5,11 +5,11 @@ import type { TaskType } from '@/api/settings';
 import type { STMessage } from '@/st/context';
 import { getContext } from '@/st/context';
 import { toast } from '@/st/toast';
-import { addSummary, deriveMemory, finalizeDelta, getLeaf, leafHash, leafValid, makeLeafId, pruneBrokenComps, stripHtml } from './apply';
+import { addSummary, deriveMemory, finalizeDelta, getLeaf, itemChangesOf, leafValid, makeLeafId, pruneBrokenComps, stripHtml, syncItemLogFromMessage } from './apply';
 import { extractJsonObject } from './json';
 import { clearInjection, refreshInjection, renderHistoryNodes, selectHistoryNodesBefore } from './inject';
-import { buildResummaryPrompt, buildSummaryPrompt, buildWorldInfoSystem, JAILBREAK_PROMPT, THINKING_CHECKLIST, THINKING_PREFILL } from './prompts';
-import { clampToTimeTags, inlineTimeTags, parseTimeRange, syncTimeTagRegex } from './timeTag';
+import { buildResummaryPrompt, buildSummaryPrompt, buildWorldInfoSystem, fmtItemLogInline, JAILBREAK_PROMPT, THINKING_CHECKLIST, THINKING_PREFILL } from './prompts';
+import { clampToTimeTags, inlineTimeTags, parseTimeRange, syncTimeTagRegex, writeItemLogTag } from './timeTag';
 import { memory, recomputeDerived, scheduleLeafFlush } from './store';
 import type { LeafExtra, SummaryDelta } from './types';
 
@@ -538,7 +538,9 @@ async function runSummaryInner(aiFloor: number): Promise<void> {
       char: ctx.name2,
       time: stateBefore.state.time,
       location: stateBefore.state.location,
-      items: stateBefore.items.map(i => ({ name: i.name, qty: i.qty, desc: i.desc })),
+      items: stateBefore.items.map(i => ({ name: i.name, qty: i.qty, desc: i.desc, carried: i.carried, location: i.location })),
+      // 变动日志已随 deriveMemory(chat, beforeIndex) 截断到本段之前,不泄漏未来
+      itemLog: stateBefore.itemLog,
       openPlans: openPlansOrdered.map(p => ({ kind: p.kind, content: p.content, createdTime: p.createdTime, targetTime: p.targetTime })),
       history,
       content,
@@ -579,10 +581,15 @@ async function runSummaryInner(aiFloor: number): Promise<void> {
       timeStart,
       timeEnd,
       createdAt: Date.now(),
-      srcHash: leafHash(chat[aiFloor].mes),
       v: 1,
     };
     chat[aiFloor].extra = { ...(chat[aiFloor].extra ?? {}), bbs_leaf: leaf };
+
+    // 把本楼物品净变动写进正文 </bbs_end> 之后(<bbs_items> 旁注,正则隐藏显示、不进副API摘要):
+    // 窗口内全文楼层会被主模型看到,提示「这笔账已结算」;滚出窗口自然消失,符合取舍。
+    // 用 stateBefore.items(本楼之前的物品)作基准算 from→to;无变动则只清旧块。
+    const changes = itemChangesOf(storedDelta, stateBefore.items, timeEnd || timeStart || '');
+    chat[aiFloor].mes = writeItemLogTag(chat[aiFloor].mes, fmtItemLogInline(changes));
 
     engineState.lastRunAt = Date.now();
 
@@ -804,7 +811,18 @@ export function bindEngine(): void {
 
   // 以下三事件只让数据/UI 跟随,不主动生成摘要。
   if (et.MESSAGE_SWIPED) es.on(et.MESSAGE_SWIPED, () => reactToChatMutation());
-  if (et.MESSAGE_EDITED) es.on(et.MESSAGE_EDITED, () => reactToChatMutation());
+  // 编辑消息:先把该楼正文里 <bbs_items> 旁注的改动反向同步回叶子 delta(用户手改物品),
+  // 再走通用善后(清坏链/重算/刷新)。延迟一拍确保 ST 已把编辑写回 chat[messageId].mes。
+  if (et.MESSAGE_EDITED) {
+    es.on(et.MESSAGE_EDITED, (messageId?: number) => {
+      setTimeout(() => {
+        if (typeof messageId === 'number') {
+          try { syncItemLogFromMessage(messageId); } catch (e) { console.warn('[柏宝书] 物品旁注反解析失败', e); }
+        }
+        reactToChatMutation();
+      }, 0);
+    });
+  }
   if (et.MESSAGE_DELETED) es.on(et.MESSAGE_DELETED, () => reactToChatMutation(true));
 
   // AI 新回复落定:不一定会触发摘要(自动摘要关闭 / 它不是「上一条 AI」),

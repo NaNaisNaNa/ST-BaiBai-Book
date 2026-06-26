@@ -1,6 +1,6 @@
 import { getContext, type STMessage } from '@/st/context';
 import { reactive } from 'vue';
-import { deriveMemory, getLeaf, leafHash, leafValid } from './apply';
+import { deriveMemory, getLeaf, leafValid } from './apply';
 import { isAiFloor, pendingAiFloors } from './engine';
 import { latestStoryTime } from './timeTag';
 import type { BaibaiMemory, LeafExtra, MemSummary, StoredDelta } from './types';
@@ -48,6 +48,7 @@ export function recomputeDerived(): void {
   memory.state.location = d.state.location;
   memory.items.splice(0, memory.items.length, ...d.items);
   memory.plans.splice(0, memory.plans.length, ...d.plans);
+  memory.itemLog.splice(0, memory.itemLog.length, ...d.itemLog);
 
   // derivedMeta:扫 chat 收集叶子(含陈旧)
   const leaves: LeafView[] = [];
@@ -162,7 +163,6 @@ function migrateV2toV3(raw: Record<string, unknown>, chat: STMessage[] | null): 
       delta,
       timeLabel: s.timeLabel as string | undefined,
       createdAt: typeof s.createdAt === 'number' ? s.createdAt : Date.now(),
-      srcHash: leafHash(chat[target].mes),
       v: 1,
     };
     chat[target].extra = { ...(chat[target].extra ?? {}), bbs_leaf: leaf };
@@ -187,7 +187,6 @@ function migrateV2toV3(raw: Record<string, unknown>, chat: STMessage[] | null): 
           text: '(迁移:历史结构化状态)',
           delta: merged,
           createdAt: Date.now(),
-          srcHash: leafHash(chat[last].mes),
           v: 1,
         },
       };

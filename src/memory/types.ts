@@ -31,8 +31,30 @@ export interface MemItem {
   desc?: string;
   /** 数量;省略表示不计数 */
   qty?: number;
+  /** 是否随身(随角色移动);省略/true=随身,永远注入。false=存放某地,仅当前地点匹配才全量注入 */
+  carried?: boolean;
+  /** 非随身时的存放地点(故事内地名);carried=false 时用于与当前地点匹配 */
+  location?: string;
   createdAt: number;
   updatedAt: number;
+}
+
+/**
+ * 物品变动日志条目(派生产物,不持久化)。
+ * 重放叶子 delta 时顺带产出:每条 add/update/remove 记一条,带「故事内时间」。
+ * 用途:注入主对话 + 喂摘要副API,让模型知道「这笔账已结算」,避免连续两段剧情把同一次消耗扣两次。
+ */
+export interface ItemLogEntry {
+  /** 物品名 */
+  name: string;
+  /** add=获得/新增,update=数量或描述变更,remove=移除/消耗尽 */
+  kind: 'add' | 'update' | 'remove';
+  /** 变更前数量(仅在已知且有意义时);qty 不计数的物品省略 */
+  from?: number;
+  /** 变更后数量(remove 后为 0/省略) */
+  to?: number;
+  /** 故事内时间(取产生该变动的叶子 timeEnd,缺则 timeStart);无则空串 */
+  time: string;
 }
 
 /**
@@ -73,8 +95,8 @@ export interface LeafExtra {
   timeLabel?: string;
   /** 生成时刻(UI 展示与 tie-break;真实重放顺序以楼层物理顺序为准) */
   createdAt: number;
-  /** hash(清洗后的 mes),正文变化时不匹配 → 叶子陈旧失效 */
-  srcHash: string;
+  /** 旧字段:hash(清洗后的 mes)。已废弃(叶子有效性改为楼层/结构匹配,不再比对正文);仅旧数据残留 */
+  srcHash?: string;
   /** 叶子结构版本 */
   v: 1;
 }
@@ -124,6 +146,8 @@ export interface BaibaiMemory {
   items: MemItem[];
   /** 派生缓存 */
   plans: MemPlan[];
+  /** 派生缓存:近期物品变动日志(重放时产出,只留最近若干条) */
+  itemLog: ItemLogEntry[];
   /** 真源:叶子摘要森林 */
   summaries: MemSummary[];
 }
@@ -134,6 +158,7 @@ export function createEmptyMemory(): BaibaiMemory {
     state: { time: '', location: '' },
     items: [],
     plans: [],
+    itemLog: [],
     summaries: [],
   };
 }
@@ -145,6 +170,10 @@ export interface ItemDelta {
   name: string;
   desc?: string;
   qty?: number;
+  /** 是否随身(角色带在身上)。省略=随身;明确放在某地点的物品填 false */
+  carried?: boolean;
+  /** 非随身时的存放地点(故事内地名) */
+  location?: string;
 }
 
 /** AI 摘要返回的完整 JSON(协议保持不变:AI 只产 add/update/remove/resolve) */

@@ -15,6 +15,8 @@ import { getContext, type STMessage } from '@/st/context';
 /** 标签固定标识(解析正则与隐藏正则都依赖它) */
 export const START_TAG = 'bbs_start';
 export const END_TAG = 'bbs_end';
+/** 物品变动旁注标签:摘要后把本楼物品净变动写进正文 </bbs_end> 之后,供窗口内全文楼层被主模型看到 */
+export const ITEMS_TAG = 'bbs_items';
 
 /** 注入主对话的固定提示词默认值(可在设置里覆盖)。 */
 export const TIME_TAG_PROMPT = `【时间锚点要求(系统强制)】
@@ -166,6 +168,40 @@ export function splitTimeLabel(label?: string): { start?: string; end?: string }
   return { start: s.slice(0, i).trim() || undefined, end: s.slice(i + 3).trim() || undefined };
 }
 
+// 物品变动块:删旧用(整段,含标签)
+const RE_ITEMS_BLOCK = new RegExp(`\\n*<${ITEMS_TAG}\\b[^>]*>[\\s\\S]*?</${ITEMS_TAG}>`, 'gi');
+
+/**
+ * 把物品变动旁注写进正文:先删掉旧的 <bbs_items> 块(幂等,重摘/重生成不叠加),
+ * 再把新块插到第一个 </bbs_end> 之后(无 end 标签则追加到末尾)。
+ * inline 为空 → 只清除旧块、不写新块(本楼无物品变动时)。
+ * 返回处理后的正文(调用方负责写回 mes)。
+ */
+export function writeItemLogTag(mes: string, inline: string): string {
+  let s = String(mes ?? '').replace(RE_ITEMS_BLOCK, '');
+  const text = inline.trim();
+  if (!text) return s;
+  const block = `<${ITEMS_TAG}>${text}</${ITEMS_TAG}>`;
+  const endMatch = s.match(new RegExp(`</${END_TAG}>`, 'i'));
+  if (endMatch && endMatch.index !== undefined) {
+    const at = endMatch.index + endMatch[0].length;
+    return `${s.slice(0, at)}\n${block}${s.slice(at)}`;
+  }
+  return `${s.trimEnd()}\n${block}`;
+}
+
+// 提取 <bbs_items> 块内文本用
+const RE_ITEMS_INNER = new RegExp(`<${ITEMS_TAG}\\b[^>]*>([\\s\\S]*?)</${ITEMS_TAG}>`, 'i');
+
+/**
+ * 读取正文里的 <bbs_items> 块内文本(去首尾空白)。
+ * 无块返回 null(区别于「有块但空」——后者返回 ''),供反解析判断用户是否删了整块。
+ */
+export function readItemsTagText(mes: string): string | null {
+  const m = String(mes ?? '').match(RE_ITEMS_INNER);
+  return m ? m[1].trim() : null;
+}
+
 /* ============ 自动注册「仅显示层隐藏」正则到 ST ============ */
 
 // ST 全局正则脚本存在 extension_settings.regex(数组)。我们用固定 id 标识自己这条,做到幂等。
@@ -176,9 +212,9 @@ const PLACEMENT_MD_DISPLAY = 0;
 const PLACEMENT_USER_INPUT = 1;
 const PLACEMENT_AI_OUTPUT = 2;
 
-/** 一条同时吃掉 start/end 标签(含其内部时间)的正则字符串(ST 用 /pattern/flags 形式) */
+/** 一条同时吃掉 start/end/items 标签(含其内部内容)的正则字符串(ST 用 /pattern/flags 形式) */
 function hideFindRegex(): string {
-  return `/<\\/?(?:${START_TAG}|${END_TAG})\\b[^>]*>(?:[\\s\\S]*?<\\/(?:${START_TAG}|${END_TAG})>)?/gi`;
+  return `/<\\/?(?:${START_TAG}|${END_TAG}|${ITEMS_TAG})\\b[^>]*>(?:[\\s\\S]*?<\\/(?:${START_TAG}|${END_TAG}|${ITEMS_TAG})>)?/gi`;
 }
 
 /**

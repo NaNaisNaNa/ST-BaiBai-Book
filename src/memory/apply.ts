@@ -1,7 +1,9 @@
 import { getContext, type STMessage } from '@/st/context';
+import { fmtItemLogInline } from './prompts';
 import { memory, recomputeDerived, saveMemory, scheduleLeafFlush } from './store';
+import { readItemsTagText, writeItemLogTag } from './timeTag';
 import { createEmptyMemory } from './types';
-import type { BaibaiMemory, LeafExtra, MemPlan, MemSummary, StoredDelta, SummaryDelta } from './types';
+import type { BaibaiMemory, ItemDelta, ItemLogEntry, LeafExtra, MemPlan, MemSummary, StoredDelta, SummaryDelta } from './types';
 
 let idSeq = 0;
 /** 生成稳定唯一 id(不依赖 random;时间走 nowMs 便于测试注入) */
@@ -39,28 +41,19 @@ export function makeLeafId(): string {
 /* ============ 文本清洗 + 陈旧识别 ============ */
 
 /**
- * 清洗楼层正文,供分析模型阅读 / 计算 srcHash:
- *  去思维链 <think>/<thinking>(大小写不敏感)、去标签、规范空白。
- * 摘要喂模型与 hash 用同一清洗,保证「纯排版/标签变化」不误判为内容变更。
+ * 清洗楼层正文,供分析模型阅读:
+ *  去思维链 <think>/<thinking>、去物品变动块 <bbs_items>(插件写进正文的旁注,不该进摘要)、去标签、规范空白。
+ * bbs_items 整段删(标签+内容):它是我们事后追加到 </bbs_end> 之后的物品变动旁注,
+ * 喂副 API 时不应混进正文(否则副 API 会把已结算的变动当本轮新发生)。
  */
 export function stripHtml(s: string): string {
   return String(s ?? '')
     .replace(/<think(?:ing)?\b[\s\S]*?<\/think(?:ing)?>/gi, '') // 思维链
+    .replace(/<bbs_items\b[^>]*>[\s\S]*?<\/bbs_items>/gi, '') // 物品变动旁注(整段删)
     .replace(/<[^>]+>/g, '') // 其余标签
     .replace(/[ \t]+\n/g, '\n') // 行尾空白
     .replace(/\n{3,}/g, '\n\n') // 折叠多余空行
     .trim();
-}
-
-/** FNV-1a 32bit → base36,对清洗后的正文敏感 */
-export function leafHash(mes: string): string {
-  const s = stripHtml(mes);
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h.toString(36);
 }
 
 /** 取消息上的叶子(不校验有效性) */
@@ -68,11 +61,16 @@ export function getLeaf(m: STMessage | undefined): LeafExtra | undefined {
   return m?.extra?.bbs_leaf as LeafExtra | undefined;
 }
 
-/** 叶子是否有效:存在且 srcHash 与当前正文匹配(正文变了即陈旧) */
+/**
+ * 叶子是否有效:挂在该楼且结构完整(有 id + delta)即有效。
+ *
+ * ⚠️ 不再比对正文哈希(旧 srcHash 机制已废):用户手动改正文(改错字、润色)是常见操作,
+ * 不该因此让整条结构化记忆失效。代价:编辑正文后不会自动重摘,该楼沿用旧叶子的结构化数据;
+ * 需要时手动删叶子(deleteLeafAt)再重摘。叶子存在 message.extra 上,天然随楼层/ swipe 跟随。
+ */
 export function leafValid(m: STMessage | undefined): boolean {
   const leaf = getLeaf(m);
-  if (!leaf || !leaf.id || !leaf.delta) return false;
-  return leaf.srcHash === leafHash(m!.mes);
+  return !!(leaf && leaf.id && leaf.delta);
 }
 
 /* ============ 重放引擎 ============ */
@@ -81,47 +79,99 @@ export function leafValid(m: STMessage | undefined): boolean {
  * 把一条叶子的 StoredDelta 施加到派生记忆 mem 上。无副作用地 fold。
  * 施加顺序(同一叶子内):items(add→update→remove)→ plans(add→resolve→reopen→remove)。
  * 顺序保证「同叶子内先添加后操作」成立(如手动在最新叶子里删掉刚加的项)。
+ *
+ * 副作用:每条物品变动往 mem.itemLog 追加一条带「故事内时间」的记录(leaf.time)。
+ * 按楼层序重放,故 itemLog 天然时序有序;deriveMemory 末尾再截最近若干条。
  */
-function applyStoredDeltaTo(mem: BaibaiMemory, d: StoredDelta, leaf: { id: string; createdAt: number }): void {
+/**
+ * 把 delta 里的随身/地点信息施加到物品上(仅在 delta 明确给了才覆盖,last-write-wins)。
+ * carried=true 时清掉 location(随身物品无存放地);carried=false 时保留/采用 location。
+ */
+function applyPlacement(it: { carried?: boolean; location?: string }, src: ItemDelta): void {
+  if (typeof src.carried === 'boolean') {
+    it.carried = src.carried;
+    if (src.carried) it.location = undefined; // 拿在身上 → 无存放地
+  }
+  if (typeof src.location === 'string') {
+    const loc = src.location.trim();
+    if (loc) {
+      it.location = loc;
+      if (it.carried === undefined) it.carried = false; // 给了地点即视为非随身
+    }
+  }
+}
+
+function applyStoredDeltaTo(mem: BaibaiMemory, d: StoredDelta, leaf: { id: string; createdAt: number; time: string }): void {
   const t = leaf.createdAt;
+  const logTime = leaf.time;
+  const log = (kind: ItemLogEntry['kind'], name: string, from?: number, to?: number): void => {
+    mem.itemLog.push({ name, kind, from, to, time: logTime });
+  };
 
   // 覆盖型:空串忽略
   if (typeof d.time === 'string' && d.time.trim()) mem.state.time = d.time.trim();
   if (typeof d.location === 'string' && d.location.trim()) mem.state.location = d.location.trim();
 
-  // 物品
+  // 物品(一切计数:add 默认 +1,带符号累加,数量 ≤0 自动移除)
   if (d.items) {
     for (const add of d.items.add ?? []) {
       if (!add?.name?.trim()) continue;
       const id = itemId(add.name);
       const ex = mem.items.find(i => i.id === id);
+      const step = typeof add.qty === 'number' ? add.qty : 1; // 缺数量默认 1
       if (ex) {
-        if (typeof add.qty === 'number') ex.qty = (ex.qty ?? 0) + add.qty;
+        const before = ex.qty;
+        const next = (ex.qty ?? 1) + step; // 原不计数旧数据按 1 起算
         if (add.desc) ex.desc = add.desc;
-        ex.updatedAt = t;
-      } else {
-        mem.items.push({
+        applyPlacement(ex, add); // 随身/地点(明确给了才覆盖)
+        if (next <= 0) {
+          mem.items.splice(mem.items.indexOf(ex), 1); // 减到 0 → 移除
+          log('remove', ex.name, before, 0);
+        } else {
+          ex.qty = next;
+          ex.updatedAt = t;
+          log('add', ex.name, before, next);
+        }
+      } else if (step > 0) {
+        const it: BaibaiMemory['items'][number] = {
           id,
           name: add.name.trim(),
           desc: add.desc?.trim() || undefined,
-          qty: typeof add.qty === 'number' ? add.qty : undefined,
+          qty: step,
           createdAt: t,
           updatedAt: t,
-        });
+        };
+        applyPlacement(it, add);
+        mem.items.push(it);
+        log('add', add.name.trim(), undefined, step);
       }
+      // step ≤0 且物品不存在:无可减,忽略
     }
     for (const upd of d.items.update ?? []) {
       if (!upd?.name?.trim()) continue;
       const it = mem.items.find(i => i.id === itemId(upd.name));
       if (!it) continue; // 容错:更新不存在的项则忽略
-      if (typeof upd.qty === 'number') it.qty = upd.qty;
+      const before = it.qty;
       if (upd.desc) it.desc = upd.desc;
+      applyPlacement(it, upd); // 随身/地点变更(移动物品)
+      if (typeof upd.qty === 'number') {
+        if (upd.qty <= 0) {
+          mem.items.splice(mem.items.indexOf(it), 1); // 设为 ≤0 → 移除
+          log('remove', it.name, before, 0);
+          continue;
+        }
+        it.qty = upd.qty;
+      }
       it.updatedAt = t;
+      log('update', it.name, before, it.qty);
     }
     for (const name of d.items.remove ?? []) {
       if (!name?.trim()) continue;
       const idx = mem.items.findIndex(i => i.id === itemId(name));
-      if (idx >= 0) mem.items.splice(idx, 1);
+      if (idx >= 0) {
+        const [removed] = mem.items.splice(idx, 1);
+        log('remove', removed.name, removed.qty, 0);
+      }
     }
   }
 
@@ -172,16 +222,128 @@ function applyStoredDeltaTo(mem: BaibaiMemory, d: StoredDelta, leaf: { id: strin
 export function deriveMemory(
   chat: STMessage[] | null,
   upToExclusive?: number,
-): Pick<BaibaiMemory, 'state' | 'items' | 'plans'> {
+): Pick<BaibaiMemory, 'state' | 'items' | 'plans' | 'itemLog'> {
   const mem = createEmptyMemory();
-  if (!chat) return { state: mem.state, items: mem.items, plans: mem.plans };
+  if (!chat) return { state: mem.state, items: mem.items, plans: mem.plans, itemLog: mem.itemLog };
   const end = typeof upToExclusive === 'number' ? Math.min(upToExclusive, chat.length) : chat.length;
   for (let i = 0; i < end; i++) {
     if (!leafValid(chat[i])) continue;
     const leaf = getLeaf(chat[i])!;
-    applyStoredDeltaTo(mem, leaf.delta, { id: leaf.id, createdAt: leaf.createdAt });
+    // 日志用「故事内时间」:结束时间优先(本段最后时刻),缺则起始,再缺旧 timeLabel,最后空串
+    const time = leaf.timeEnd?.trim() || leaf.timeStart?.trim() || leaf.timeLabel?.trim() || '';
+    applyStoredDeltaTo(mem, leaf.delta, { id: leaf.id, createdAt: leaf.createdAt, time });
   }
-  return { state: mem.state, items: mem.items, plans: mem.plans };
+  // 只留最近若干条变动(注入/喂模型够用即可,省 token)
+  if (mem.itemLog.length > ITEM_LOG_KEEP) mem.itemLog = mem.itemLog.slice(-ITEM_LOG_KEEP);
+  return { state: mem.state, items: mem.items, plans: mem.plans, itemLog: mem.itemLog };
+}
+
+/** 变动日志保留的最近条数(注入与喂摘要共用)。 */
+export const ITEM_LOG_KEEP = 8;
+
+/**
+ * 算「单条 delta 相对给定先前物品状态」产生的物品变动条目(供写进该楼正文)。
+ * 复用 applyStoredDeltaTo:用先前物品播种一个临时 mem,只施加这一条 delta,
+ * 捕获其 itemLog 即本楼净变动(带 from→to)。time 由调用方传入(本楼故事结束时间)。
+ */
+export function itemChangesOf(
+  delta: StoredDelta,
+  priorItems: BaibaiMemory['items'],
+  time: string,
+): ItemLogEntry[] {
+  const mem = createEmptyMemory();
+  // 深拷贝先前物品作起点(避免污染调用方);只关心 items,plans/state 不影响 itemLog
+  mem.items = priorItems.map(i => ({ ...i }));
+  applyStoredDeltaTo(mem, { items: delta.items }, { id: 'tmp', createdAt: 0, time });
+  return mem.itemLog;
+}
+
+/* ============ <bbs_items> 旁注 ↔ delta 反向同步(用户改正文) ============ */
+
+/**
+ * 解析 <bbs_items> 块的「动词式」多行文本 → 带符号物品增量。
+ * 每行:`<动词> <名字> [数量]`。动词:获得=+,消耗/失去=-。缺数量默认 1。
+ * 名字可含空格(取动词后、末尾可选数字前的全部);非法行忽略。
+ * 返回 add 形式(qty 带符号,复用 applyStoredDeltaTo 的带符号累加 + ≤0 移除语义)。
+ */
+export function parseItemLogText(text: string): { name: string; qty: number }[] {
+  const out: { name: string; qty: number }[] = [];
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = line.match(/^(获得|消耗|失去)\s+(.+?)(?:\s+(\d+))?$/);
+    if (!m) continue;
+    const sign = m[1] === '获得' ? 1 : -1;
+    const name = m[2].trim();
+    if (!name) continue;
+    const n = m[3] ? Number(m[3]) : 1;
+    if (!Number.isFinite(n) || n <= 0) continue;
+    out.push({ name, qty: sign * n });
+  }
+  return out;
+}
+
+/**
+ * 用户编辑了某楼正文后,把其中 <bbs_items> 旁注的改动反向同步回该楼叶子的 delta.items。
+ *
+ * 一致性判定走「同一渲染管线」:把叶子现有 delta 渲染成规范旁注,与正文里的旁注比对;
+ * 相等 → 用户没动物品(只改了别处正文)→ 跳过,不碰 delta、不重写正文(避免误改/抖动)。
+ * 不等 → 以正文为准:解析成带符号 add,**替换**该叶子 delta 的 items 部分(time/location/plans 保留),
+ *        重算派生、删坏链,并把正文旁注重写成规范格式(顺手清掉用户的非规范写法),最后落盘。
+ *
+ * 注:旁注不承载描述/数量绝对值,反解析按「增量」表达;故用户改旁注会丢失原 delta 里的 desc(可接受,
+ * 描述请走物品列表编辑)。无 <bbs_items> 块(用户删了整块)→ 视作清空该楼物品变动。
+ * 返回是否发生了改写。
+ */
+export function syncItemLogFromMessage(index: number): boolean {
+  const chat = getContext()?.chat;
+  const leaf = getLeaf(chat?.[index]);
+  if (!chat || !leaf || !leaf.delta) return false;
+
+  // 该楼之前的物品状态(用于把 delta 渲染成与正文同口径的旁注做比对)
+  const prior = deriveMemory(chat, index).items;
+  const time = leaf.timeEnd?.trim() || leaf.timeStart?.trim() || leaf.timeLabel?.trim() || '';
+  const currentInline = fmtItemLogInline(itemChangesOf(leaf.delta, prior, time));
+
+  const tagText = readItemsTagText(chat[index].mes); // null = 无块
+  const editedInline = tagText === null ? '' : fmtItemLogInline(parsedToLog(parseItemLogText(tagText), prior));
+
+  if (currentInline === editedInline) return false; // 物品旁注未变,跳过
+
+  // 以正文为准:解析成带符号 add,替换 delta 的 items 部分。
+  // 旁注不承载随身/地点,按物品名从旧 delta 的 add/update 里继承回来,避免改数量误清空间信息。
+  const placeBefore = new Map<string, { carried?: boolean; location?: string }>();
+  for (const e of [...(leaf.delta.items?.add ?? []), ...(leaf.delta.items?.update ?? [])]) {
+    if (e.carried !== undefined || e.location !== undefined) {
+      placeBefore.set(itemId(e.name), { carried: e.carried, location: e.location });
+    }
+  }
+  const parsed = parseItemLogText(tagText ?? '');
+  if (parsed.length) {
+    leaf.delta.items = {
+      add: parsed.map(p => {
+        const place = placeBefore.get(itemId(p.name));
+        return { name: p.name, qty: p.qty, ...(place ?? {}) };
+      }),
+    };
+  } else delete leaf.delta.items;
+
+  chat[index].extra = { ...(chat[index].extra ?? {}), bbs_leaf: leaf };
+
+  // 正文旁注重写成规范格式(用规范化后的 delta 重新渲染)
+  const canonical = fmtItemLogInline(itemChangesOf(leaf.delta, prior, time));
+  chat[index].mes = writeItemLogTag(chat[index].mes, canonical);
+
+  recomputeDerived();
+  pruneBrokenComps();
+  scheduleLeafFlush();
+  return true;
+}
+
+/** 把解析出的带符号增量套用到先前状态,得到 ItemLogEntry[](供渲染比对,与 itemChangesOf 同口径)。 */
+function parsedToLog(parsed: { name: string; qty: number }[], prior: BaibaiMemory['items']): ItemLogEntry[] {
+  if (!parsed.length) return [];
+  return itemChangesOf({ items: { add: parsed.map(p => ({ name: p.name, qty: p.qty })) } }, prior, '');
 }
 
 /* ============ AI delta → 固化 StoredDelta ============ */

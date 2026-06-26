@@ -260,12 +260,38 @@ export function buildHistoryInjectionText(): string {
   return `[历史剧情摘要]\n${renderHistoryNodesWithRelative(sums, latestStoryTime(chat))}`;
 }
 
+/**
+ * 物品存放地是否与当前地点匹配(可达):包含式模糊匹配,任一方包含另一方即算。
+ * 兼容 AI 命名粗细不一(「客栈」⊂「城西客栈二楼」)。空地点不匹配。
+ */
+function locationReachable(itemLoc: string | undefined, here: string): boolean {
+  const a = (itemLoc ?? '').trim();
+  const b = here.trim();
+  if (!a || !b) return false;
+  return a.includes(b) || b.includes(a);
+}
+
 /** 组合当前结构化状态注入文本;无有意义状态时返回空串。 */
 export function buildStateInjectionText(): string {
   const st: string[] = [];
   if (memory.state.time) st.push(`当前时间:${memory.state.time}`);
   if (memory.state.location) st.push(`当前地点:${memory.state.location}`);
-  st.push(`物品清单:\n${fmtItems(memory.items.map(i => ({ name: i.name, qty: i.qty, desc: i.desc })))}`);
+
+  // 物品分两组省 token:可达(随身 / 存放地匹配当前地点)发全量(名+量+描述);
+  // 他处寄存的只发名+数量(砍掉描述这个大头),既省 token 又不至于让主模型以为东西没了。
+  const here = memory.state.location || '';
+  const reachable = memory.items.filter(i => i.carried !== false || locationReachable(i.location, here));
+  const elsewhere = memory.items.filter(i => !(i.carried !== false || locationReachable(i.location, here)));
+  st.push(`物品清单:\n${fmtItems(reachable.map(i => ({ name: i.name, qty: i.qty, desc: i.desc, carried: i.carried, location: i.location })))}`);
+  if (elsewhere.length) {
+    // 仅名+数量,按地点括注;无描述
+    const brief = elsewhere
+      .map(i => `  - ${i.name}${typeof i.qty === 'number' ? ` ×${i.qty}` : ''}(存:${i.location || '某处'})`)
+      .join('\n');
+    st.push(`他处寄存物品(回到对应地点才有完整信息):\n${brief}`);
+  }
+  // 注:近期物品变动不在此注入。改为摘要后写进对应楼层正文 </bbs_end> 之后(见 engine.ts),
+  // 窗口内全文楼层天然可见、滚出窗口自然消失 —— 符合「物品变动只在那段时间有用」的取舍。
   const openPlans = memory.plans
     .filter(p => p.status === 'open')
     .map(p => ({ kind: p.kind, content: p.content, createdTime: p.createdTime, targetTime: p.targetTime }));
