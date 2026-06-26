@@ -403,20 +403,18 @@ function saveEdit() {
         :class="{ 'is-deep': r.level > 0, 'is-stale': r.stale }"
       >
         <header class="bbs-summary-meta">
-          <!-- 总结:保留层级标签 + 范围药丸 + 时间(多条合并,需要标识层级) -->
+          <!-- 总结:层级标签 + 范围药丸 + 相对时间(留题首行)+ 绝对时间(窄屏换行) -->
           <template v-if="r.kind === 'comp'">
             <span class="bbs-summary-badge">{{ levelLabel(r.level) }}</span>
             <span class="bbs-summary-loc">{{ floorLabel(r) }}</span>
-            <span v-if="rowTime(r)" class="bbs-summary-time">
-              <span v-if="rowRelative(r)" class="bbs-summary-rel">({{ rowRelative(r) }})</span>{{ rowTime(r) }}
-            </span>
+            <span v-if="rowRelative(r)" class="bbs-summary-rel">({{ rowRelative(r) }})</span>
+            <span v-if="rowTime(r)" class="bbs-summary-time">{{ rowTime(r) }}</span>
           </template>
-          <!-- 摘要:时间作日期题首,楼层用中点轻接;无时间时楼层自身升为题首 -->
+          <!-- 摘要:相对时间 + 楼层号都做成等高小标签(盒子居中,免去 CJK 基线下沉),绝对时间作题首文本(窄屏换行) -->
           <template v-else>
-            <span v-if="rowTime(r)" class="bbs-summary-dateline">
-              <span v-if="rowRelative(r)" class="bbs-summary-rel">({{ rowRelative(r) }})</span>{{ rowTime(r) }}
-            </span>
-            <span class="bbs-summary-floor-inline" :class="{ 'is-lead': !rowTime(r) }">{{ floorLabel(r) }}</span>
+            <span v-if="rowRelative(r)" class="bbs-summary-rel">{{ rowRelative(r) }}</span>
+            <span class="bbs-summary-loc">{{ floorLabel(r) }}</span>
+            <span v-if="rowTime(r)" class="bbs-summary-dateline">{{ rowTime(r) }}</span>
           </template>
           <span v-if="r.stale" class="bbs-summary-stale">待更新</span>
           <span class="bbs-summary-acts">
@@ -929,6 +927,11 @@ function saveEdit() {
   margin-bottom: 6px;
   flex-wrap: wrap;
 }
+/* 绝对时间作题首文本,line-height:1 让它与同行等高标签的视觉中心对齐 */
+.bbs-summary-dateline,
+.bbs-summary-time {
+  line-height: 1;
+}
 /* 摘要题首:故事内时间升为主标题,稍大、半粗、tabular 数字像账册日期 */
 .bbs-summary-dateline {
   font-size: 14px;
@@ -936,25 +939,6 @@ function saveEdit() {
   color: var(--bbs-ink);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.01em;
-}
-/* 楼层:用中点轻接在日期后,弱化为副信息;无时间时(.is-lead)自身升为题首 */
-.bbs-summary-floor-inline {
-  font-size: 12px;
-  color: var(--bbs-ink-muted);
-  font-variant-numeric: tabular-nums;
-}
-.bbs-summary-floor-inline::before {
-  content: '·';
-  margin-right: 8px;
-  color: var(--bbs-ink-muted);
-}
-.bbs-summary-floor-inline.is-lead {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--bbs-ink);
-}
-.bbs-summary-floor-inline.is-lead::before {
-  content: none;
 }
 /* 标签与楼层号:高度一致(同 height + 居中);楼层号最小宽 = 摘要标签宽,数字变长再撑开 */
 .bbs-summary-badge,
@@ -975,22 +959,33 @@ function saveEdit() {
   background: var(--bbs-accent);
   border: 1px solid var(--bbs-accent); /* 与 loc 同样有 1px 边框,保证两者等高 */
 }
-/* 楼层号/收纳数:描边定位标签;tabular 数字对齐 */
+/* 楼层号/收纳数:描边定位标签;tabular 数字对齐。
+   纯数字(#6)无下伸笔画、墨迹偏上,盒子居中也压不正,下推 2px 让数字视觉居中。 */
 .bbs-summary-loc {
   color: var(--bbs-ink-soft);
   background: var(--bbs-surface-2);
   border: 1px solid var(--bbs-line);
   font-variant-numeric: tabular-nums;
+  margin-top: 2px;
 }
 .bbs-summary-time {
   font-size: 12px;
   color: var(--bbs-ink-soft);
 }
-/* 相对时间前缀(昨天/3天前…):弱化为强调色小字,贴在绝对时间前 */
+/* 相对时间(昨天/3天前…):做成等高小标签,与楼层药丸同高,靠盒子居中,免去 CJK 字形基线下沉。
+   强调色描边填充,区别于灰底的楼层药丸。 */
 .bbs-summary-rel {
-  margin-right: 4px;
-  color: var(--bbs-accent);
+  box-sizing: border-box;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  font-size: 11px;
   font-weight: 600;
+  border-radius: var(--bbs-radius-sm);
+  color: var(--bbs-accent);
+  background: var(--bbs-accent-soft);
+  border: 1px solid var(--bbs-accent);
 }
 /* 动作组靠右;平时隐身,hover/聚焦该卡才浮现 */
 .bbs-summary-acts {
@@ -1081,6 +1076,14 @@ function saveEdit() {
   .bbs-state {
     flex-direction: column;
     gap: 8px;
+  }
+
+  /* 摘要题首窄屏排布:绝对时间(纯文本)较长,会把相对时间+楼层标签挤满首行、把操作键顶到第二行。
+     用 order 把绝对时间排到末尾并 flex-basis:100% 独占一行,首行只留「相对时间标签 + 楼层标签 + 操作键」。 */
+  .bbs-summary-dateline,
+  .bbs-summary-time {
+    order: 99;
+    flex-basis: 100%;
   }
 }
 </style>
