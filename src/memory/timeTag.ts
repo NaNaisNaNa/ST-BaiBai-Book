@@ -171,9 +171,13 @@ export function splitTimeLabel(label?: string): { start?: string; end?: string }
 // 物品变动块:删旧用(整段,含标签)
 const RE_ITEMS_BLOCK = new RegExp(`\\n*<${ITEMS_TAG}\\b[^>]*>[\\s\\S]*?</${ITEMS_TAG}>`, 'gi');
 
+// 定位「最后一个 </bbs_end>」用(全局扫,取末次):正文末尾的时间标签才是真正的剧情结束,
+// 思维链/状态栏可能在前面混入同名标签,故不能用第一个(见 clampToTimeTags 同款考量)。
+const RE_END_CLOSE_G = new RegExp(`</${END_TAG}>`, 'gi');
+
 /**
  * 把物品变动旁注写进正文:先删掉旧的 <bbs_items> 块(幂等,重摘/重生成不叠加),
- * 再把新块插到第一个 </bbs_end> 之后(无 end 标签则追加到末尾)。
+ * 再把新块插到**最后一个** </bbs_end> 之后(无 end 标签则追加到末尾)。
  * inline 为空 → 只清除旧块、不写新块(本楼无物品变动时)。
  * 返回处理后的正文(调用方负责写回 mes)。
  */
@@ -181,11 +185,14 @@ export function writeItemLogTag(mes: string, inline: string): string {
   let s = String(mes ?? '').replace(RE_ITEMS_BLOCK, '');
   const text = inline.trim();
   if (!text) return s;
-  const block = `<${ITEMS_TAG}>${text}</${ITEMS_TAG}>`;
-  const endMatch = s.match(new RegExp(`</${END_TAG}>`, 'i'));
-  if (endMatch && endMatch.index !== undefined) {
-    const at = endMatch.index + endMatch[0].length;
-    return `${s.slice(0, at)}\n${block}${s.slice(at)}`;
+  // 标签与内容各自独占行,块前留空行,排版清爽且不与时间标签粘连
+  const block = `<${ITEMS_TAG}>\n${text}\n</${ITEMS_TAG}>`;
+  // 取最后一个 </bbs_end> 的结束位置
+  let lastEnd = -1;
+  RE_END_CLOSE_G.lastIndex = 0;
+  for (let m = RE_END_CLOSE_G.exec(s); m; m = RE_END_CLOSE_G.exec(s)) lastEnd = m.index + m[0].length;
+  if (lastEnd >= 0) {
+    return `${s.slice(0, lastEnd)}\n${block}${s.slice(lastEnd)}`;
   }
   return `${s.trimEnd()}\n${block}`;
 }
@@ -205,8 +212,10 @@ export function readItemsTagText(mes: string): string | null {
 /* ============ 自动注册「仅显示层隐藏」正则到 ST ============ */
 
 // ST 全局正则脚本存在 extension_settings.regex(数组)。我们用固定 id 标识自己这条,做到幂等。
+// id 保持历史值 'bbs-time-tag-hide' 不变(改 id 会导致老用户旧正则残留 + 新建一条重复);
+// 显示名已更新——这条正则如今同时隐藏时间标签与物品变动标签。
 const HIDE_SCRIPT_ID = 'bbs-time-tag-hide';
-const HIDE_SCRIPT_NAME = '柏宝书 · 隐藏时间标签';
+const HIDE_SCRIPT_NAME = '柏宝书 · 隐藏记忆标签';
 // regex_placement(见 ST regex/engine.js):0=MD_DISPLAY 1=USER_INPUT 2=AI_OUTPUT
 const PLACEMENT_MD_DISPLAY = 0;
 const PLACEMENT_USER_INPUT = 1;
@@ -218,7 +227,7 @@ function hideFindRegex(): string {
 }
 
 /**
- * 确保 ST 里存在我们的「隐藏时间标签」正则脚本(仅影响显示,不影响提示词)。
+ * 确保 ST 里存在我们的「隐藏记忆标签」正则脚本(隐藏时间标签 + 物品变动标签,仅影响显示,不影响提示词)。
  * 幂等:按固定 id 查,缺则补、已存在则更新内容(防止旧版本格式残留)。用户手动删了下次启动会再加回。
  */
 export function ensureHideRegexRegistered(): void {

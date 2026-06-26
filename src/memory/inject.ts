@@ -38,8 +38,9 @@ const TIMETAG_INJECT_KEY = 'baibai_book_time_tag';
 const HISTORY_INJECT_DEPTH = 9999;
 const STATE_INJECT_DEPTH_AFTER_LATEST_AI = 1;
 const STATE_INJECT_DEPTH_BEFORE_LATEST_AI = 2;
-/** 时间标签提示词贴近最近对话(浅 depth),作为对「下一条回复」的强指令 */
-const TIMETAG_INJECT_DEPTH = 1;
+/** 时间标签提示词独立注入到 D0(最底、最贴近下一条回复),作为对「下一条回复」的最强指令,
+ *  不与状态快照(D1/D2)同层 */
+const TIMETAG_INJECT_DEPTH = 0;
 
 /**
  * 一条叶子是否「已启用」(应注入)。
