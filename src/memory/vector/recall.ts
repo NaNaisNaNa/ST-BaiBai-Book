@@ -147,10 +147,13 @@ interface RankedHit extends VecHit {
 async function rerankCandidates(query: string, hits: VecHit[], signal?: AbortSignal): Promise<RankedHit[]> {
   // rerank 渠道未配置 → 直接降级(embedTexts/resolveVectorModel 在 rerank 缺渠道时会抛错)
   try {
-    // 全文精排:发楼层原文(mesFull)给 rerank,语义比摘要更全;无原文(如种子叶子)退摘要。
-    // 带故事时间头,给 rerank 模型时间上下文(超长由 rerankDocuments 内部按 token 截断/分批)。
+    // 全文精排:发楼层原文(mesFull,已含内嵌起止时间)给 rerank,语义比摘要更全;
+    // 无原文(如种子叶子)退摘要 document,此时补 【故事时间】头给时间上下文。
+    // (超长由 rerankDocuments 内部按 token 截断/分批)
     const docs = hits.map(h => {
-      const body = h.mesFull || h.document || '';
+      const full = (h.mesFull || '').trim();
+      if (full) return full;
+      const body = (h.document || '').trim();
       const t = (h.storyTime || '').trim();
       return t ? `【${t}】\n${body}` : body;
     });
@@ -183,16 +186,19 @@ function buildRecallText(ranked: RankedHit[], cfg: typeof apiSettings.vector.rec
 
     const isFull = h.rerankScore >= cfg.rerankThreshold && fullUsed < cfg.fullTextCount;
     if (isFull) {
+      // 全文档优先发 mesFull(已含内嵌的起止时间),无则退 document
+      const useMesFull = !!(h.mesFull || '').trim();
       const body = (h.mesFull || h.document || '').trim();
       if (!body) continue;
       seen.add(h.leafId);
       fullUsed++;
-      fullChunks.push(fmtChunk(h, body));
+      // mesFull 自带 (起始时间…)/(结束时间…),不再加 【】头避免时间重复;退到 document 时才补头
+      fullChunks.push(fmtChunk(h, body, useMesFull));
     } else if (h.similarity >= cfg.embeddingThreshold) {
       const body = (h.document || '').trim();
       if (!body) continue;
       seen.add(h.leafId);
-      briefChunks.push(fmtChunk(h, body));
+      briefChunks.push(fmtChunk(h, body, false)); // 摘要档无内嵌时间,补 【】头
     }
     // 两档都不达标:丢弃
   }
@@ -202,8 +208,9 @@ function buildRecallText(ranked: RankedHit[], cfg: typeof apiSettings.vector.rec
   return `[相关回忆]\n${chunks.join('\n\n')}`;
 }
 
-/** 单条召回片段:带故事时间前缀(若有)。 */
-function fmtChunk(h: RankedHit, body: string): string {
+/** 单条召回片段:body 未自带内嵌时间时补一个故事时间 【】头(若有)。 */
+function fmtChunk(h: RankedHit, body: string, bodyHasInlineTime: boolean): string {
+  if (bodyHasInlineTime) return body;
   const t = (h.storyTime || '').trim();
   return t ? `【${t}】${body}` : body;
 }
