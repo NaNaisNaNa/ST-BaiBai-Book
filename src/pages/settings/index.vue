@@ -2,7 +2,7 @@
 import Collapsible from '@/components/Collapsible.vue';
 import Icon from '@/components/Icon.vue';
 import { fetchModels, testChannel } from '@/api/client';
-import { apiSettings, newChannel, type ApiChannel } from '@/api/settings';
+import { apiSettings, newChannel, resolveVectorModel, type ApiChannel } from '@/api/settings';
 import { getContext } from '@/st/context';
 import {
   JAILBREAK_PROMPT,
@@ -13,6 +13,8 @@ import {
   type PromptMacro,
 } from '@/memory/prompts';
 import { TIME_TAG_PROMPT } from '@/memory/timeTag';
+import { syncVectorIndex } from '@/memory/vector';
+import { computeCarryoverPlan, createNewChatWithCarryover, type CarryoverPlan } from '@/memory/carryover';
 import { ui, THEMES, type NavPosition } from '@/state/ui';
 import { computed, nextTick, ref } from 'vue';
 
@@ -28,9 +30,9 @@ type ChannelScope = 'api' | 'vector';
 // editingId:正在编辑的「已有渠道」id;新建时为 null。仅用于「完成」时定位写回目标。
 const editingId = ref<string | null>(null);
 const editingScope = ref<ChannelScope>('api');
-// 当前 scope 对应的渠道数组(增删/查找都走它)
-function channelsOf(scope: ChannelScope): ApiChannel[] {
-  return scope === 'vector' ? apiSettings.vector.channels : apiSettings.channels;
+// 当前 scope 对应的渠道数组(增删/查找都走它)。向量已改扁平端点,只剩副 API 用渠道。
+function channelsOf(_scope: ChannelScope): ApiChannel[] {
+  return apiSettings.channels;
 }
 // 编辑用「草稿副本」:v-model 全改在草稿上,只有点「完成」才写回 apiSettings(避免每敲一字就触发存盘)。
 // 弹窗开关也以它为准:草稿存在 = 弹窗打开。
@@ -112,14 +114,10 @@ function removeChannel(id: string) {
   const list = channelsOf(scope);
   const idx = list.findIndex(c => c.id === id);
   if (idx >= 0) list.splice(idx, 1);
-  // 清理指派:副 API 清两类摘要指派;向量清三个角色里引用到的渠道
+  // 清理指派:副 API 清两类摘要指派(向量已改扁平端点,不再走渠道系统)
   if (scope === 'api') {
     if (apiSettings.assignments.summary === id) apiSettings.assignments.summary = '';
     if (apiSettings.assignments.resummary === id) apiSettings.assignments.resummary = '';
-  } else {
-    for (const role of ['embedding', 'rerank', 'queryRewrite'] as const) {
-      if (apiSettings.vector[role].channel === id) apiSettings.vector[role].channel = '';
-    }
   }
 }
 
@@ -259,10 +257,98 @@ interface VectorRoleMeta {
   label: string;
 }
 const VECTOR_ROLES: VectorRoleMeta[] = [
-  { key: 'embedding', label: 'Embedding 模型' },
-  { key: 'rerank', label: 'Rerank 模型' },
-  { key: 'queryRewrite', label: 'Query 重写模型' },
+  { key: 'embedding', label: 'Embedding(向量化,必填)' },
+  { key: 'rerank', label: 'Rerank(重排)' },
+  { key: 'queryRewrite', label: 'Query 重写' },
 ];
+
+/* —— 向量端点:每角色直接填 地址/密钥/模型;模型可一键拉取(combobox)。 —— */
+const vecShowKey = ref<Record<VectorRole, boolean>>({ embedding: false, rerank: false, queryRewrite: false });
+const vecModels = ref<Record<VectorRole, string[]>>({ embedding: [], rerank: [], queryRewrite: [] });
+const vecLoadingModels = ref<Record<VectorRole, boolean>>({ embedding: false, rerank: false, queryRewrite: false });
+const vecModelMsg = ref<Record<VectorRole, string>>({ embedding: '', rerank: '', queryRewrite: '' });
+// combobox:当前展开的角色(null=都收起)+ 过滤词
+const vecModelMenuOpen = ref<VectorRole | null>(null);
+const vecModelQuery = ref('');
+
+async function pullVecModels(role: VectorRole) {
+  // 解析回落后的地址/密钥:rerank/query 留空时自动用 Embedding 的去拉(模型仍写回本角色)
+  const ep = resolveVectorModel(role);
+  if (!ep.url.trim()) {
+    vecModelMsg.value[role] = role === 'embedding' ? '请先填 Embedding 地址' : '请先填本角色或 Embedding 的地址';
+    return;
+  }
+  vecLoadingModels.value[role] = true;
+  vecModelMsg.value[role] = '';
+  try {
+    const list = await fetchModels({ url: ep.url, key: ep.key });
+    vecModels.value[role] = list;
+    if (list.length && !apiSettings.vector[role].model) apiSettings.vector[role].model = list[0];
+    if (!list.length) vecModelMsg.value[role] = '未返回任何模型';
+  } catch (e) {
+    vecModelMsg.value[role] = e instanceof Error ? e.message : String(e);
+  } finally {
+    vecLoadingModels.value[role] = false;
+  }
+}
+function filteredVecModels(role: VectorRole): string[] {
+  const q = vecModelQuery.value.trim().toLowerCase();
+  const list = vecModels.value[role] ?? [];
+  const out = q ? list.filter(m => m.toLowerCase().includes(q)) : list;
+  return out.slice(0, 200);
+}
+function openVecModelMenu(role: VectorRole) {
+  vecModelQuery.value = '';
+  vecModelMenuOpen.value = role;
+}
+function pickVecModel(role: VectorRole, m: string) {
+  apiSettings.vector[role].model = m;
+  vecModelMenuOpen.value = null;
+  vecModelQuery.value = '';
+}
+function closeVecModelMenuSoon() {
+  setTimeout(() => {
+    vecModelMenuOpen.value = null;
+    vecModelQuery.value = '';
+  }, 150);
+}
+
+/* —— 索引维护:手动重建当前聊天向量索引 —— */
+const vecIndexing = ref(false);
+const vecIndexMsg = ref('');
+async function doRebuildIndex() {
+  if (vecIndexing.value) return;
+  vecIndexing.value = true;
+  vecIndexMsg.value = '';
+  try {
+    const n = await syncVectorIndex();
+    vecIndexMsg.value = n > 0 ? `已索引 ${n} 条新摘要。` : '没有需要新增的索引(已是最新)。';
+  } catch (e) {
+    vecIndexMsg.value = `索引失败:${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    vecIndexing.value = false;
+  }
+}
+
+/* —— 带数据创建新对话 —— */
+const carrying = ref(false);
+const carryMsg = ref('');
+// 携带计划:展开面板时实时算(纯读 chat,不缓存,避免切聊天后过期)
+const carryPlan = computed<CarryoverPlan>(() => computeCarryoverPlan());
+async function doCarryover() {
+  if (carrying.value) return;
+  if (!confirm('将基于当前聊天创建一个带数据的新对话并切入。继续吗?')) return;
+  carrying.value = true;
+  carryMsg.value = '';
+  try {
+    const ok = await createNewChatWithCarryover();
+    carryMsg.value = ok ? '已创建新对话。' : '创建未完成(详见提示)。';
+  } catch (e) {
+    carryMsg.value = `创建失败:${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    carrying.value = false;
+  }
+}
 
 /* —— 排除角色:勾选的角色名(含重名卡)的聊天里,记忆系统所有功能都不生效。
    按「名字」排除,所以同名卡是一批一起排除。列表很长时易卡,故:① 仅在弹窗打开时取/去重角色名;
@@ -509,59 +595,226 @@ function insertMacro(token: string) {
 
         <hr class="bbs-rule" />
 
-        <!-- 向量专用渠道(独立于副 API):顶部添加 + 紧凑列表 -->
-        <div class="bbs-channel-bar">
-          <span class="bbs-field-label">向量渠道</span>
-          <button class="bbs-btn bbs-btn-primary bbs-btn-sm" type="button" @click="addChannel('vector')">
-            <Icon name="plus" /> 添加渠道
-          </button>
-        </div>
-        <ul v-if="apiSettings.vector.channels.length" class="bbs-channel-list">
-          <li v-for="ch in apiSettings.vector.channels" :key="ch.id" class="bbs-channel-item">
-            <button class="bbs-channel-open" type="button" @click="openChannel(ch.id, 'vector')">
-              <span class="bbs-channel-item-name">{{ ch.name || '未命名渠道' }}</span>
-              <span class="bbs-channel-item-model">{{ ch.model || '未设模型' }}</span>
-            </button>
-          </li>
-        </ul>
-        <p v-else class="bbs-field-hint">还没有向量渠道。点「添加渠道」配置 Embedding/Rerank 等要用的 API。</p>
-
-        <hr class="bbs-rule" />
-
-        <!-- 模型配置:每个角色一组(渠道 + 模型名);rerank/query 留空复用 embedding -->
+        <!-- 三个端点:Embedding 必填;Rerank/Query 地址留空 = 整体复用 Embedding。
+             每块直接填地址/密钥/模型,模型可一键拉取(无需「渠道」中转)。 -->
         <div
           v-for="role in VECTOR_ROLES"
           :key="role.key"
-          class="bbs-vec-model"
+          class="bbs-vec-ep"
           :class="{ 'is-disabled': !apiSettings.vector.enabled }"
         >
           <div class="bbs-vec-head">
             <span class="bbs-field-label">{{ role.label }}</span>
+            <span v-if="role.key !== 'embedding'" class="bbs-vec-reuse-tag">地址/密钥可留空复用</span>
           </div>
-          <div class="bbs-vec-grid">
-            <label class="bbs-vec-cell">
-              <span class="bbs-vec-cell-label">渠道</span>
-              <select
-                v-model="apiSettings.vector[role.key].channel"
-                class="bbs-input bbs-select bbs-vec-select"
-                :disabled="!apiSettings.vector.enabled"
-              >
-                <option value="">{{ role.key === 'embedding' ? '— 未指派 —' : '— 复用 Embedding —' }}</option>
-                <option v-for="c in apiSettings.vector.channels" :key="c.id" :value="c.id">{{ c.name }}</option>
-              </select>
-            </label>
-            <label class="bbs-vec-cell">
-              <span class="bbs-vec-cell-label">模型名</span>
+
+          <label class="bbs-modal-field">
+            <span class="bbs-modal-label">API 地址</span>
+            <input
+              v-model="apiSettings.vector[role.key].url"
+              class="bbs-input"
+              :placeholder="role.key === 'embedding' ? '如 https://api.openai.com/v1' : '留空 = 复用 Embedding 的地址'"
+              :disabled="!apiSettings.vector.enabled"
+            />
+          </label>
+
+          <label class="bbs-modal-field">
+            <span class="bbs-modal-label">API 密钥</span>
+            <div class="bbs-model-row">
               <input
-                v-model="apiSettings.vector[role.key].model"
-                class="bbs-input bbs-vec-input"
-                type="text"
-                :placeholder="role.key === 'embedding' ? '如 text-embedding-3-small' : '留空复用 Embedding'"
+                v-model="apiSettings.vector[role.key].key"
+                class="bbs-input"
+                :type="vecShowKey[role.key] ? 'text' : 'password'"
+                :placeholder="role.key === 'embedding' ? 'API 密钥' : '留空 = 复用 Embedding 的密钥'"
                 :disabled="!apiSettings.vector.enabled"
               />
-            </label>
-          </div>
+              <button
+                class="bbs-icon-mini"
+                type="button"
+                :title="vecShowKey[role.key] ? '隐藏密钥' : '显示密钥'"
+                @click="vecShowKey[role.key] = !vecShowKey[role.key]"
+              >
+                <Icon :name="vecShowKey[role.key] ? 'eye-off' : 'eye'" />
+              </button>
+            </div>
+          </label>
+
+          <!-- 模型:三个角色各自独立(embedding/rerank/query 模型本就不同),都要单独选,从不复用。
+               拉取走「该角色的地址/密钥」,留空则自动用 Embedding 的地址/密钥去拉。 -->
+          <label class="bbs-modal-field">
+            <span class="bbs-modal-label">模型</span>
+            <div class="bbs-model-row">
+              <div class="bbs-combo">
+                <input
+                  v-model="apiSettings.vector[role.key].model"
+                  class="bbs-input"
+                  :placeholder="(vecModels[role.key]?.length) ? '搜索或输入模型名…' : '模型名,或点右侧拉取'"
+                  :disabled="!apiSettings.vector.enabled"
+                  @focus="openVecModelMenu(role.key)"
+                  @input="vecModelQuery = apiSettings.vector[role.key].model; vecModelMenuOpen = role.key"
+                  @blur="closeVecModelMenuSoon"
+                />
+                <span
+                  v-if="vecModels[role.key]?.length"
+                  class="bbs-combo-caret"
+                  :class="{ 'is-open': vecModelMenuOpen === role.key }"
+                  aria-hidden="true"
+                />
+                <ul v-if="vecModelMenuOpen === role.key && vecModels[role.key]?.length" class="bbs-combo-menu">
+                  <li v-if="!filteredVecModels(role.key).length" class="bbs-combo-empty">无匹配模型</li>
+                  <li
+                    v-for="m in filteredVecModels(role.key)"
+                    :key="m"
+                    class="bbs-combo-item"
+                    :class="{ 'is-active': m === apiSettings.vector[role.key].model }"
+                    @mousedown.prevent="pickVecModel(role.key, m)"
+                  >
+                    {{ m }}
+                  </li>
+                </ul>
+              </div>
+              <button
+                class="bbs-icon-mini"
+                type="button"
+                :title="vecLoadingModels[role.key] ? '拉取中…' : '拉取模型'"
+                :disabled="!apiSettings.vector.enabled || vecLoadingModels[role.key]"
+                @click="pullVecModels(role.key)"
+              >
+                <Icon name="refresh" />
+              </button>
+            </div>
+          </label>
+          <p v-if="vecModelMsg[role.key]" class="bbs-field-hint">{{ vecModelMsg[role.key] }}</p>
         </div>
+
+        <hr class="bbs-rule" />
+
+        <!-- 召回参数:候选数 → 阈值分档 → 条数上限 -->
+        <div class="bbs-vec-recall" :class="{ 'is-disabled': !apiSettings.vector.enabled }">
+          <div class="bbs-vec-head"><span class="bbs-field-label">召回参数</span></div>
+          <p class="bbs-field-hint">
+            先对全部向量索引算 embedding 相似度,取得分最高的若干条进入 rerank;rerank 打分后分两档:
+            得分高的发原文全文,稍低但仍过 embedding 阈值的发摘要;两档合计不超过「最终召回条数」。
+          </p>
+
+          <label class="bbs-switch-row">
+            <span class="bbs-field-label">启用查询重写</span>
+            <input
+              v-model="apiSettings.vector.recall.queryRewriteEnabled"
+              type="checkbox"
+              class="bbs-checkbox"
+              :disabled="!apiSettings.vector.enabled"
+            />
+          </label>
+          <p class="bbs-field-hint">
+            生成前用小模型(上方 Query 重写)把当前剧情重写成多条检索 query,多路召回更全面;
+            需配「Query 重写」模型,未配或失败则自动降级为用最近上下文直接检索。每回合多一次小模型请求(略增延迟)。
+          </p>
+
+          <label class="bbs-num-row">
+            <span class="bbs-field-label">Rerank 候选数</span>
+            <input
+              v-model.number="apiSettings.vector.recall.rerankCandidates"
+              class="bbs-input bbs-num"
+              type="number"
+              min="1"
+              :disabled="!apiSettings.vector.enabled"
+            />
+          </label>
+          <p class="bbs-field-hint">按 embedding 相似度取前 N 条进入 rerank 精排(越大越准但越慢)。</p>
+
+          <label class="bbs-num-row">
+            <span class="bbs-field-label">Embedding 阈值</span>
+            <input
+              v-model.number="apiSettings.vector.recall.embeddingThreshold"
+              class="bbs-input bbs-num"
+              type="number"
+              step="0.01"
+              min="0"
+              max="1"
+              :disabled="!apiSettings.vector.enabled"
+            />
+          </label>
+          <p class="bbs-field-hint">摘要档准入门槛:embedding 相似度低于此的内容连摘要都不召回(0~1)。</p>
+
+          <label class="bbs-num-row">
+            <span class="bbs-field-label">Rerank 阈值</span>
+            <input
+              v-model.number="apiSettings.vector.recall.rerankThreshold"
+              class="bbs-input bbs-num"
+              type="number"
+              step="0.01"
+              min="0"
+              max="1"
+              :disabled="!apiSettings.vector.enabled"
+            />
+          </label>
+          <p class="bbs-field-hint">rerank 得分 ≥ 此值的发原文全文,低于此但过 embedding 阈值的退为发摘要(0~1)。</p>
+
+          <label class="bbs-num-row">
+            <span class="bbs-field-label">召回全文数</span>
+            <input
+              v-model.number="apiSettings.vector.recall.fullTextCount"
+              class="bbs-input bbs-num"
+              type="number"
+              min="0"
+              :disabled="!apiSettings.vector.enabled"
+            />
+          </label>
+          <p class="bbs-field-hint">全文档最多取几条发原文(其余即便过 rerank 阈值也退为摘要)。</p>
+
+          <label class="bbs-num-row">
+            <span class="bbs-field-label">最终召回条数</span>
+            <input
+              v-model.number="apiSettings.vector.recall.finalRecallCount"
+              class="bbs-input bbs-num"
+              type="number"
+              min="0"
+              :disabled="!apiSettings.vector.enabled"
+            />
+          </label>
+          <p class="bbs-field-hint">召回总条数上限(全文 + 摘要合计);全文不够用摘要补,补不满也无妨。</p>
+        </div>
+
+        <hr class="bbs-rule" />
+
+        <!-- 索引维护:把当前聊天的叶子摘要补建/对账进向量库 -->
+        <div class="bbs-vec-recall" :class="{ 'is-disabled': !apiSettings.vector.enabled }">
+          <div class="bbs-vec-head"><span class="bbs-field-label">索引维护</span></div>
+          <p class="bbs-field-hint">
+            正常情况下叶子摘要会随生成自动索引;若中途才开启向量记忆,可手动把当前聊天已有的摘要补建进向量库。
+          </p>
+          <button
+            class="bbs-btn bbs-btn-sm"
+            type="button"
+            :disabled="!apiSettings.vector.enabled || vecIndexing"
+            @click="doRebuildIndex"
+          >
+            {{ vecIndexing ? '索引中…' : '重建当前聊天向量索引' }}
+          </button>
+          <p v-if="vecIndexMsg" class="bbs-field-hint">{{ vecIndexMsg }}</p>
+        </div>
+      </Collapsible>
+
+      <!-- 带数据创建新对话 -->
+      <Collapsible title="带数据创建新对话" :open="false">
+        <p class="bbs-field-hint">
+          把当前聊天的「最近全文窗口 + 合并历史摘要 + 当前状态(物品/计划)」打包,创建一个新对话带过去。
+          新对话从一片「种子叶子」重放还原状态,旧剧情作为摘要随行;若开了向量记忆,旧聊天会被快照,
+          新对话可向量召回它的内容(逐次累加,分支也自动继承)。
+        </p>
+        <div v-if="carryPlan" class="bbs-field-hint">
+          将携带:AI {{ carryPlan.aiCount }} 条 / 实际消息 {{ carryPlan.carryCount }} 条;旧剧情摘要 {{ carryPlan.recapLen > 0 ? '有' : '无' }}。
+        </div>
+        <button
+          class="bbs-btn bbs-btn-sm bbs-btn-primary"
+          type="button"
+          :disabled="carrying || !carryPlan?.hasData"
+          @click="doCarryover"
+        >
+          {{ carrying ? '创建中…' : '带数据创建新对话' }}
+        </button>
+        <p v-if="carryMsg" class="bbs-field-hint">{{ carryMsg }}</p>
       </Collapsible>
     </div>
 
@@ -1193,7 +1446,8 @@ function insertMacro(token: string) {
 }
 
 /* —— 向量记忆:每个模型角色一组卡片(渠道 + 模型名两列) —— */
-.bbs-vec-model {
+/* 向量端点卡片(Embedding/Rerank/Query 各一块,扁平填地址/密钥/模型) */
+.bbs-vec-ep {
   margin-top: 12px;
   padding: 12px 14px;
   border: 1px solid var(--bbs-line);
@@ -1201,32 +1455,28 @@ function insertMacro(token: string) {
   background: var(--bbs-surface-2);
   transition: opacity var(--bbs-dur) var(--bbs-ease);
 }
-.bbs-vec-model.is-disabled {
+.bbs-vec-ep.is-disabled {
+  opacity: 0.5;
+}
+/* 召回参数/索引维护整组在关闭向量记忆时一并置灰 */
+.bbs-vec-recall.is-disabled {
   opacity: 0.5;
 }
 .bbs-vec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-bottom: 10px;
 }
-.bbs-vec-grid {
-  display: flex;
-  gap: 10px;
-}
-.bbs-vec-cell {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-.bbs-vec-cell-label {
+/* 「复用 Embedding / 独立端点」状态小标签 */
+.bbs-vec-reuse-tag {
   font-size: 11px;
   color: var(--bbs-ink-muted);
-}
-/* 这两列里的下拉/输入撑满各自单元格,覆盖 .bbs-select 的 60% 上限 */
-.bbs-vec-select,
-.bbs-vec-input {
-  max-width: none;
-  width: 100%;
+  padding: 1px 8px;
+  border: 1px solid var(--bbs-line);
+  border-radius: 999px;
+  white-space: nowrap;
 }
 
 /* —— 自定义提示词列表 —— */
@@ -1424,13 +1674,6 @@ function insertMacro(token: string) {
   }
   .bbs-seg {
     font-size: 12px;
-  }
-  /* 向量模型两列在窄屏堆叠成两行,下拉/输入不再挤成一团 */
-  .bbs-vec-grid {
-    flex-direction: column;
-  }
-  .bbs-vec-cell-label {
-    font-size: 10.5px;
   }
   /* 渠道弹窗底部:测试按钮窄屏只显短版「测试」,PC 显完整「测试渠道」 */
   .bbs-btn-label-full {

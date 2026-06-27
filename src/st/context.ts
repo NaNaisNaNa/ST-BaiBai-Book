@@ -140,3 +140,20 @@ export function getContext(): STContext | null {
     return null;
   }
 }
+
+/**
+ * 取 ST 的 doNewChat(getContext 未暴露,从 /script.js 动态取)。
+ * 用于「带数据创建新对话」:doNewChat({deleteCurrentChat:false}) 在当前角色下新建一个空聊天并切入。
+ * 取不到(旧版/路径变动)时返回 null,调用方据此降级报错。
+ */
+export async function getDoNewChat(): Promise<((opts?: { deleteCurrentChat?: boolean }) => Promise<void>) | null> {
+  try {
+    // 变量持有路径,避免 Vite/vue-tsc 把 /script.js 当本地模块解析
+    const scriptPath = '/script.js';
+    const mod: Record<string, unknown> = await import(/* @vite-ignore */ scriptPath);
+    const fn = mod.doNewChat;
+    return typeof fn === 'function' ? (fn as (opts?: { deleteCurrentChat?: boolean }) => Promise<void>) : null;
+  } catch {
+    return null;
+  }
+}

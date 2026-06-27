@@ -41,26 +41,55 @@ export interface CustomPrompts {
   timeTag: string;
 }
 
-/** 单个向量模型的配置。channel 空=复用 embedding 的渠道;model 空=复用 embedding 的模型名。 */
-export interface VectorModelConfig {
-  /** 指派的渠道 id(取自 channels);空串=复用 embedding 的渠道 */
-  channel: string;
-  /** 模型名;空串=复用 embedding 的模型 */
+/**
+ * 单个向量角色的端点配置(扁平:自带地址+密钥+模型,不再经「渠道」中转)。
+ * embedding 为基准必填;rerank/queryRewrite 的 url 留空 = 整体复用 embedding 的端点与模型。
+ */
+export interface VectorEndpoint {
+  /** OpenAI 兼容 base url(如 https://api.openai.com/v1);rerank/query 留空=复用 embedding */
+  url: string;
+  /** API 密钥 */
+  key: string;
+  /** 模型名 */
   model: string;
 }
 
-/** 向量记忆设置。embedding 为基准,rerank/queryRewrite 留空则整体复用 embedding。 */
+/**
+ * 召回参数。召回管线:
+ *  ① 所有向量索引各算一次 embedding 相似度,**纯按得分排序取前 N(rerankCandidates)进入 rerank**——
+ *     这一步不套 embedding 阈值,哪怕前 N 全是低分(0.4/0.3…)也照样进候选;阈值只在 ② 的摘要档准入用。
+ *  ② rerank 打分后分两档:
+ *     · 全文档 = rerank 得分 ≥ rerankThreshold,取前 fullTextCount 条(发原文全文);
+ *     · 摘要档 = rerank 得分 < rerankThreshold 但 embedding 得分 ≥ embeddingThreshold(发叶子摘要);
+ *  ③ 最终召回条数 ≤ finalRecallCount(上限):先放全文档,不足再用摘要档补,补不满也无妨。
+ */
+export interface VectorRecallSettings {
+  /** 进入 rerank 的候选数:纯按 embedding 相似度取 top-N(不套阈值过滤) */
+  rerankCandidates: number;
+  /** embedding 相似度阈值:仅用于 ② 摘要档准入门槛(低于此连摘要都不召回);不影响 ① 取候选 */
+  embeddingThreshold: number;
+  /** rerank 得分阈值:≥ 进全文档,< 退摘要档 */
+  rerankThreshold: number;
+  /** 召回全文数:全文档取前 N 条(发原文) */
+  fullTextCount: number;
+  /** 最终召回条数(上限):全文档 + 摘要档合计不超过它 */
+  finalRecallCount: number;
+  /** 是否启用查询重写(小模型把当前剧情重写成多条检索 query;需配 Query 重写模型) */
+  queryRewriteEnabled: boolean;
+}
+
+/** 向量记忆设置。embedding 为基准,rerank/queryRewrite 的 url 留空则整体复用 embedding。 */
 export interface VectorSettings {
   /** 向量记忆开关 */
   enabled: boolean;
-  /** 向量专用渠道列表(与副 API 的 channels 相互独立) */
-  channels: ApiChannel[];
-  /** 文本向量化模型(基准,其余两个可复用它) */
-  embedding: VectorModelConfig;
-  /** 重排模型;留空复用 embedding */
-  rerank: VectorModelConfig;
-  /** 查询重写模型;留空复用 embedding */
-  queryRewrite: VectorModelConfig;
+  /** 文本向量化端点(基准,必填) */
+  embedding: VectorEndpoint;
+  /** 重排端点;url 留空复用 embedding */
+  rerank: VectorEndpoint;
+  /** 查询重写端点;url 留空复用 embedding */
+  queryRewrite: VectorEndpoint;
+  /** 召回参数(候选数/阈值/条数) */
+  recall: VectorRecallSettings;
 }
 
 /** 界面偏好里要跨设备同步的部分(主题/导航位置);activePage 等纯本机临时态不在此。 */
@@ -123,10 +152,17 @@ function defaults(): ApiSettings {
     prompts: { summary: '', resummary: '', jailbreak: '', timeTag: '' },
     vector: {
       enabled: false,
-      channels: [],
-      embedding: { channel: '', model: '' },
-      rerank: { channel: '', model: '' },
-      queryRewrite: { channel: '', model: '' },
+      embedding: { url: '', key: '', model: '' },
+      rerank: { url: '', key: '', model: '' },
+      queryRewrite: { url: '', key: '', model: '' },
+      recall: {
+        rerankCandidates: 20,
+        embeddingThreshold: 0.5,
+        rerankThreshold: 0.5,
+        fullTextCount: 3,
+        finalRecallCount: 8,
+        queryRewriteEnabled: true,
+      },
     },
     channels: [],
     assignments: { summary: '', resummary: '' },
@@ -156,19 +192,31 @@ function normalize(raw: unknown): ApiSettings {
   merged.excludedChars = Array.isArray(merged.excludedChars)
     ? merged.excludedChars.filter((x): x is string => typeof x === 'string')
     : [];
-  // vector 同为嵌套对象(且内含子对象),逐层兜底,老数据缺字段时回退默认
+  // vector 同为嵌套对象(且内含子对象),逐层兜底,老数据缺字段时回退默认。
+  // 注:旧结构曾有 vector.channels + {channel,model};扁平化后弃用,逐角色按 url/key/model 兜底,
+  // 老数据缺这些字段会回退空串(等于「未配置」,用户重填一次即可)。
   const rv = ((raw as Partial<ApiSettings>).vector ?? {}) as Partial<VectorSettings>;
   merged.vector = {
     ...d.vector,
     ...rv,
-    embedding: { ...d.vector.embedding, ...(rv.embedding ?? {}) },
-    rerank: { ...d.vector.rerank, ...(rv.rerank ?? {}) },
-    queryRewrite: { ...d.vector.queryRewrite, ...(rv.queryRewrite ?? {}) },
+    embedding: normalizeVectorEndpoint(rv.embedding),
+    rerank: normalizeVectorEndpoint(rv.rerank),
+    queryRewrite: normalizeVectorEndpoint(rv.queryRewrite),
+    recall: { ...d.vector.recall, ...(rv.recall ?? {}) },
   };
-  // 渠道:逐个补全新加的字段(老数据没有 stream/excludeParams),并校验类型
+  // 副 API 渠道:逐个补全新加的字段(老数据没有 stream/excludeParams),并校验类型
   merged.channels = (Array.isArray(merged.channels) ? merged.channels : []).map(normalizeChannel);
-  merged.vector.channels = (Array.isArray(merged.vector.channels) ? merged.vector.channels : []).map(normalizeChannel);
   return merged;
+}
+
+/** 补全单个向量端点的字段并校验类型(缺失/类型不符回退空串)。 */
+function normalizeVectorEndpoint(e: Partial<VectorEndpoint> | undefined): VectorEndpoint {
+  const o = e ?? {};
+  return {
+    url: typeof o.url === 'string' ? o.url : '',
+    key: typeof o.key === 'string' ? o.key : '',
+    model: typeof o.model === 'string' ? o.model : '',
+  };
 }
 
 /** 补全单个渠道的缺失字段(stream/excludeParams 是后加的),并校验类型。 */
@@ -339,19 +387,18 @@ export function getChannelForTask(task: TaskType): ApiChannel | null {
 }
 
 /**
- * 解析某个向量子任务实际使用的渠道与模型:rerank/queryRewrite 任一项留空就回落到 embedding。
- * 返回 { channel, model };渠道可能为 null(没指派/找不到),交由调用方处理。
+ * 解析某个向量角色实际使用的端点(url/key/model)。
+ * 三个角色的**模型各自独立**(embedding/rerank/query 模型本就不同),从不复用;
+ * 能复用的只有**地址与密钥**:rerank/queryRewrite 的 url/key 各自留空时,分别回落到 embedding 的。
  */
-export function resolveVectorModel(role: 'embedding' | 'rerank' | 'queryRewrite'): {
-  channel: ApiChannel | null;
-  model: string;
-} {
+export function resolveVectorModel(role: 'embedding' | 'rerank' | 'queryRewrite'): VectorEndpoint {
   const v = apiSettings.vector;
   const base = v.embedding;
+  if (role === 'embedding') return { ...base };
   const cfg = v[role];
-  const channelId = cfg.channel || base.channel;
-  const model = cfg.model || base.model;
-  // 渠道取自向量专用列表(与副 API 渠道独立)
-  const channel = channelId ? v.channels.find(c => c.id === channelId) ?? null : null;
-  return { channel, model };
+  return {
+    url: cfg.url.trim() || base.url, // 地址留空 → 复用 embedding 地址
+    key: cfg.key.trim() || base.key, // 密钥留空 → 复用 embedding 密钥
+    model: cfg.model, // 模型始终独立,不回落
+  };
 }

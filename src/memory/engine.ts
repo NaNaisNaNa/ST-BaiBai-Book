@@ -12,6 +12,8 @@ import { buildResummaryPrompt, buildSummaryPrompt, buildWorldInfoSystem, fmtItem
 import { clampToTimeTags, inlineTimeTags, parseTimeRange, syncTimeTagRegex, writeItemLogTag } from './timeTag';
 import { memory, recomputeDerived, scheduleLeafFlush } from './store';
 import type { LeafExtra, SummaryDelta } from './types';
+import { scheduleVectorIndex } from './vector';
+import { clearRecallInjection } from './vector/recall';
 
 /** 引擎运行状态(供 UI 显示) */
 import { reactive, watch } from 'vue';
@@ -597,6 +599,7 @@ async function runSummaryInner(aiFloor: number): Promise<void> {
     recomputeDerived();
     refreshInjection();
     scheduleLeafFlush();
+    scheduleVectorIndex(); // 新叶子 → 防抖同步进向量库(失败静默,不影响摘要)
 
     // 摘要积累到阈值则触发总结
     await checkResummary();
@@ -762,6 +765,7 @@ function reactToChatMutation(syncHidden = false): void {
     reactTimer = null;
     pruneBrokenComps(); // 叶子失效 → 删包含它的整条祖先压缩链
     recomputeDerived(); // 删叶/陈旧 → 物品/计划回退;UI(derivedMeta)更新
+    scheduleVectorIndex(); // 删楼/编辑/翻页 → 防抖对账向量库(删陈旧、补新)
     if (syncHidden && engineActiveHere() && apiSettings.autoSummaryEnabled) {
       void syncWindowHiddenState(getContext()?.chat ?? [])
         .catch(e => {
@@ -832,6 +836,7 @@ export function bindEngine(): void {
   if (et.CHAT_CHANGED) {
     es.on(et.CHAT_CHANGED, () => {
       // 记忆重载由 store 的 CHAT_CHANGED 监听负责;此处仅在其后刷新注入
+      clearRecallInjection(); // 切聊天先抹掉上个聊天的召回残留(新聊天下次生成再重算)
       setTimeout(() => refreshInjection(), 0);
     });
   }

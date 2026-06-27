@@ -1,0 +1,235 @@
+/**
+ * 阻塞式向量召回:生成主回复前,按用户输入 + 近期上下文检索相关旧记忆,注入主对话。
+ *
+ * 管线(全程阻塞,对齐既定方案,不做预取/异步):
+ *  1. 查询重写(开关开 + 配了 Query 重写模型时):小模型把当前剧情重写成 INTENT + 多条检索 Q;
+ *     失败/未启用则降级为「最近上下文当单条 query」。
+ *  2. 各 query 各自 embed → vec/search(scopes = 当前 chat + 各 bundle,后端多路 RRF 融合),
+ *     纯按 embedding 得分取前 rerankCandidates 条(不套阈值)。
+ *  3. rerank 候选(用 INTENT 作 query;渠道未配则降级:跳过 rerank,用 embedding 序)。
+ *  4. 分档:全文档(rerank≥阈值,取前 fullTextCount,发原文 mes_full)/ 摘要档(embedding≥阈值,发 document)。
+ *  5. 按 leaf_id 去重 + 排除当前窗口内已全文的叶子 → 拼注入文本 → setExtensionPrompt。
+ *
+ * 失败/未配置全程静默降级(清空注入槽),向量是增强项,绝不阻断生成。
+ */
+
+import { getContext, type STMessage } from '@/st/context';
+import { apiSettings } from '@/api/settings';
+import { isBaiBaoKuAvailable, vecSearch, type VecHit } from '@/api/baibaoku';
+import { getLeaf, leafValid } from '../apply';
+import { embedTexts, embedToBase64, encodeFloat32Base64, rerankDocuments } from './embed';
+import { rewriteQuery } from './rewrite';
+import { ensureRecallIndex } from './index';
+import { currentVectorDb, recallScopes } from './scope';
+import { resolveKeepStart } from '../engine';
+
+// 注入槽位:贴近历史摘要层(顶部附近),与 inject.ts 的历史摘要同一区域但独立 key。
+const RECALL_INJECT_KEY = 'baibai_book_vector_recall';
+const IN_CHAT = 1;
+const ROLE_SYSTEM = 0;
+const RECALL_INJECT_DEPTH = 8; // 略低于历史摘要(9999),高于状态(1/2):当作「捞回的旧剧情」
+
+/** 取最近 N 条消息文本拼成检索 query(用户视角的「我现在在问什么」)。 */
+function buildQueryText(chat: STMessage[]): string {
+  // 最近若干条(含最新用户输入),清洗后拼接。窗口太大反而稀释焦点,取末尾 4 条。
+  const QUERY_CTX = 4;
+  const parts: string[] = [];
+  for (let i = Math.max(0, chat.length - QUERY_CTX); i < chat.length; i++) {
+    const m = chat[i];
+    if (!m || typeof m.mes !== 'string') continue;
+    const t = m.mes.trim();
+    if (t) parts.push(t);
+  }
+  return parts.join('\n').slice(0, 4000); // 上限防超长
+}
+
+/** 当前保留窗口内、已发全文的叶子 id(召回要排除它们,避免与全文重复)。 */
+function windowLeafIds(chat: STMessage[]): string[] {
+  const keepStart = resolveKeepStart(chat);
+  const ids: string[] = [];
+  for (let i = keepStart; i < chat.length; i++) {
+    if (leafValid(chat[i])) ids.push(getLeaf(chat[i])!.id);
+  }
+  return ids;
+}
+
+let recalling = false;
+
+/** 召回是否在当前聊天生效。 */
+function recallActiveHere(): boolean {
+  if (!apiSettings.vector.enabled) return false;
+  return !!currentVectorDb() && recallScopes().length > 0;
+}
+
+/** 这种生成类型是否该触发召回:只在产出新正文的生成前召回。 */
+export function shouldRecallForType(type: string | undefined): boolean {
+  // 续写/安静/扮演不需要召回旧记忆(continue 接着写、quiet/impersonate 非剧情推进)
+  return type !== 'continue' && type !== 'quiet' && type !== 'impersonate';
+}
+
+/** 清空召回注入槽(降级/未命中/切聊天时)。 */
+export function clearRecallInjection(): void {
+  getContext()?.setExtensionPrompt?.(RECALL_INJECT_KEY, '', IN_CHAT, RECALL_INJECT_DEPTH, false, ROLE_SYSTEM, null);
+}
+
+/**
+ * 执行一次阻塞召回并写注入槽。在生成拦截器放行路径里 await。
+ * 任何失败都清空槽并返回(静默降级)。
+ */
+export async function runVectorRecall(signal?: AbortSignal): Promise<void> {
+  if (!recallActiveHere()) {
+    clearRecallInjection();
+    return;
+  }
+  if (recalling) return;
+  const database = currentVectorDb();
+  if (!database) return;
+
+  const ctx = getContext();
+  const chat = ctx?.chat ?? [];
+  const fn = ctx?.setExtensionPrompt;
+  if (typeof fn !== 'function' || !chat.length) return;
+
+  const cfg = apiSettings.vector.recall;
+  const scopes = recallScopes();
+
+  recalling = true;
+  try {
+    if (!(await isBaiBaoKuAvailable())) {
+      clearRecallInjection();
+      return;
+    }
+
+    // 召回前先补齐窗口外缺失的向量索引(载入老聊天/向量后开 → 旧叶子可能从未索引),
+    // 否则这些旧剧情会直接漏召回。只阻塞窗口外,窗口内交给防抖增量。
+    await ensureRecallIndex(signal);
+
+    const queryText = buildQueryText(chat);
+    if (!queryText) {
+      clearRecallInjection();
+      return;
+    }
+
+    // 1) 查询重写:得多条 query 向量 + rerank 用的 query 文本。失败/未启用降级为单 query。
+    const { queryVectors, rerankQuery } = await resolveQueryVectors(queryText, cfg, signal);
+    if (!queryVectors.length) {
+      clearRecallInjection();
+      return;
+    }
+
+    // 2) 后端检索:多路在范围内纯按 embedding 得分取前 rerankCandidates(后端 RRF 融合,不套阈值),排除窗口内叶子
+    const exclude = windowLeafIds(chat);
+    const { results } = await vecSearch(database, scopes, queryVectors, {
+      topK: Math.max(1, cfg.rerankCandidates),
+      excludeLeafIds: exclude,
+    });
+    if (!results.length) {
+      clearRecallInjection();
+      return;
+    }
+
+    // 3) rerank(用 INTENT/重写 query;渠道未配 → 降级:用 embedding 序,score 复用 similarity)
+    const ranked = await rerankCandidates(rerankQuery, results, signal);
+
+    // 4) 分档 + 上限
+    const text = buildRecallText(ranked, cfg);
+    fn(RECALL_INJECT_KEY, text, IN_CHAT, RECALL_INJECT_DEPTH, false, ROLE_SYSTEM, null);
+  } catch (e) {
+    console.warn('[柏宝书向量] 召回失败(降级为不召回):', e);
+    clearRecallInjection();
+  } finally {
+    recalling = false;
+  }
+}
+
+/**
+ * 解析检索用的多条 query 向量 + rerank 用的 query 文本。
+ *  - 启用查询重写且配了模型 → rewrite 得 INTENT + 多条 Q,各自 embed;rerank query 用 INTENT(无则首条 Q)。
+ *  - 未启用/重写失败 → 降级:用「最近上下文」当单 query;rerank query 也用它。
+ */
+async function resolveQueryVectors(
+  queryText: string,
+  cfg: typeof apiSettings.vector.recall,
+  signal?: AbortSignal,
+): Promise<{ queryVectors: string[]; rerankQuery: string }> {
+  // queryRewrite 模型独立必填(地址/密钥才可留空复用);未配 model 则不尝试重写
+  const hasRewriteModel = !!apiSettings.vector.queryRewrite.model.trim();
+  if (cfg.queryRewriteEnabled && hasRewriteModel) {
+    try {
+      const { intent, queries } = await rewriteQuery(signal);
+      // 检索向量:多条 Q(INTENT 偏长偏全文,留给 rerank,不进检索向量以免稀释)
+      if (!queries.length) throw new Error('重写无 query');
+      const vecs = await embedTexts(queries, signal);
+      const queryVectors = vecs.map(v => encodeFloat32Base64(v));
+      return { queryVectors, rerankQuery: intent || queries[0] || queryText };
+    } catch (e) {
+      console.warn('[柏宝书向量] 查询重写失败,降级为单 query:', e);
+    }
+  }
+  // 降级:单 query
+  const single = await embedToBase64(queryText, signal);
+  return { queryVectors: [single], rerankQuery: queryText };
+}
+
+interface RankedHit extends VecHit {
+  rerankScore: number; // 无 rerank 时 = similarity
+}
+
+/** 对候选做 rerank;失败/未配置则用 embedding 相似度序降级。 */
+async function rerankCandidates(query: string, hits: VecHit[], signal?: AbortSignal): Promise<RankedHit[]> {
+  // rerank 渠道未配置 → 直接降级(embedTexts/resolveVectorModel 在 rerank 缺渠道时会抛错)
+  try {
+    const docs = hits.map(h => h.document || h.mesFull || '');
+    const order = await rerankDocuments(query, docs, hits.length, signal);
+    // order 是 {index, score} 降序;映射回 hit
+    return order
+      .filter(o => hits[o.index])
+      .map(o => ({ ...hits[o.index], rerankScore: o.score }));
+  } catch {
+    // 降级:保持 embedding 序,rerankScore 复用 similarity
+    return hits.map(h => ({ ...h, rerankScore: h.similarity }));
+  }
+}
+
+/**
+ * 按分档规则拼注入文本:
+ *  - 全文档:rerankScore ≥ rerankThreshold,取前 fullTextCount,发 mes_full(无则退 document)。
+ *  - 摘要档:rerankScore < rerankThreshold 但 similarity ≥ embeddingThreshold,发 document。
+ *  - 总数 ≤ finalRecallCount;按 leaf_id 去重(已在后端跨 scope 合并,这里再兜底)。
+ */
+function buildRecallText(ranked: RankedHit[], cfg: typeof apiSettings.vector.recall): string {
+  const seen = new Set<string>();
+  const fullChunks: string[] = [];
+  const briefChunks: string[] = [];
+  let fullUsed = 0;
+
+  for (const h of ranked) {
+    if (seen.size >= cfg.finalRecallCount) break;
+    if (seen.has(h.leafId)) continue;
+
+    const isFull = h.rerankScore >= cfg.rerankThreshold && fullUsed < cfg.fullTextCount;
+    if (isFull) {
+      const body = (h.mesFull || h.document || '').trim();
+      if (!body) continue;
+      seen.add(h.leafId);
+      fullUsed++;
+      fullChunks.push(fmtChunk(h, body));
+    } else if (h.similarity >= cfg.embeddingThreshold) {
+      const body = (h.document || '').trim();
+      if (!body) continue;
+      seen.add(h.leafId);
+      briefChunks.push(fmtChunk(h, body));
+    }
+    // 两档都不达标:丢弃
+  }
+
+  const chunks = [...fullChunks, ...briefChunks];
+  if (!chunks.length) return '';
+  return `[相关回忆]\n${chunks.join('\n\n')}`;
+}
+
+/** 单条召回片段:带故事时间前缀(若有)。 */
+function fmtChunk(h: RankedHit, body: string): string {
+  const t = (h.storyTime || '').trim();
+  return t ? `【${t}】${body}` : body;
+}
