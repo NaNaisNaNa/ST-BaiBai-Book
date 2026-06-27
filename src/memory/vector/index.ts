@@ -12,7 +12,7 @@
  */
 
 import { getContext, type STMessage } from '@/st/context';
-import { apiSettings } from '@/api/settings';
+import { apiSettings, engineActiveHere } from '@/api/settings';
 import { isBaiBaoKuAvailable, vecReconcile, vecUpsert, type VecItem } from '@/api/baibaoku';
 import { getLeaf, leafValid, stripHtml } from '../apply';
 import { resolveKeepStart } from '../engine';
@@ -72,8 +72,9 @@ function collectLeaves(chat: STMessage[]): LeafForIndex[] {
 let indexing = false;
 let timer: ReturnType<typeof setTimeout> | null = null;
 
-/** 向量记忆是否在当前聊天可索引(开关开 + 进入了单角色聊天)。 */
+/** 向量记忆是否在当前聊天可索引(总开关开 + 当前角色未排除 + 向量开关开 + 进入了单角色聊天)。 */
 export function vectorIndexableHere(): boolean {
+  if (!engineActiveHere()) return false; // 插件总开关关 / 当前角色被排除 → 不索引
   if (!apiSettings.vector.enabled) return false;
   return !!currentVectorDb() && !!currentChatId();
 }

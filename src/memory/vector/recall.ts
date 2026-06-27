@@ -14,7 +14,7 @@
  */
 
 import { getContext, type STMessage } from '@/st/context';
-import { apiSettings } from '@/api/settings';
+import { apiSettings, engineActiveHere } from '@/api/settings';
 import { isBaiBaoKuAvailable, vecSearch, type VecHit } from '@/api/baibaoku';
 import { getLeaf, leafValid } from '../apply';
 import { embedTexts, encodeFloat32Base64, rerankDocuments } from './embed';
@@ -43,6 +43,7 @@ let recalling = false;
 
 /** 召回是否在当前聊天生效。 */
 function recallActiveHere(): boolean {
+  if (!engineActiveHere()) return false; // 插件总开关关 / 当前角色被排除 → 不召回
   if (!apiSettings.vector.enabled) return false;
   return !!currentVectorDb() && recallScopes().length > 0;
 }
