@@ -20,14 +20,39 @@ import { getLeaf, leafValid } from '../apply';
 import { embedTexts, encodeFloat32Base64, rerankDocuments } from './embed';
 import { rewriteQuery } from './rewrite';
 import { ensureRecallIndex } from './index';
-import { currentVectorDb, recallScopes } from './scope';
+import { currentChatScope, currentVectorDb, recallScopes } from './scope';
 import { resolveKeepStart } from '../engine';
+import { compactTimeLabel, latestStoryTime, splitTimeLabel } from '../timeTag';
+import { relativeTimeLabel } from '../timeRel';
+import {
+  previewOf,
+  resetRecallDebug,
+  setRecallEmbedding,
+  setRecallInjected,
+  setRecallRerank,
+  setRecallRewrite,
+  setRecallStatus,
+  type RecallDebugRerankHit,
+} from './debug';
 
 // 注入槽位:贴近历史摘要层(顶部附近),与 inject.ts 的历史摘要同一区域但独立 key。
 const RECALL_INJECT_KEY = 'baibai_book_vector_recall';
 const IN_CHAT = 1;
 const ROLE_SYSTEM = 0;
-const RECALL_INJECT_DEPTH = 8; // 略低于历史摘要(9999),高于状态(1/2):当作「捞回的旧剧情」
+const RECALL_INJECT_DEPTH = 0; // D0:贴最底(紧邻用户最新输入),让召回的相关回忆离当前语境最近
+
+/**
+ * 命中来源标记:
+ *  - scope 等于当前聊天 → 本聊天命中,显示楼层号「#5」(msgIndex 即当前楼层号);
+ *  - 否则(bundle:<hash>)→ 来自「带数据建新对话」冻结的旧聊天快照,显示「旧档」。
+ * 旧聊天的真实名字/楼层号未追踪(bundle 只存 hash),故统一标「旧档」让用户知道非本聊天。
+ */
+function sourceLabel(hit: VecHit, selfScope: string | null): string {
+  if (selfScope && hit.scope === selfScope) {
+    return typeof hit.msgIndex === 'number' && hit.msgIndex >= 0 ? `#${hit.msgIndex}` : '本聊天';
+  }
+  return '旧档';
+}
 
 /** 当前保留窗口内、已发全文的叶子 id(召回要排除它们,避免与全文重复)。 */
 function windowLeafIds(chat: STMessage[]): string[] {
@@ -82,7 +107,11 @@ export async function runVectorRecall(signal?: AbortSignal): Promise<void> {
 
   recalling = true;
   try {
+    // 开一次新调试快照(进入有效召回路径才记录,避免「功能未启用」时反复清空上次结果)
+    resetRecallDebug();
+
     if (!(await isBaiBaoKuAvailable())) {
+      setRecallStatus('未召回:柏宝库后端不可用');
       clearRecallInjection();
       return;
     }
@@ -95,17 +124,30 @@ export async function runVectorRecall(signal?: AbortSignal): Promise<void> {
     // 重写失败/无 query 会抛错 → 落到外层 catch,清空注入槽、结束本次召回。
     const { queryVectors, rerankQuery } = await resolveQueryVectors(signal);
     if (!queryVectors.length) {
+      setRecallStatus('未召回:查询重写未产出 query');
       clearRecallInjection();
       return;
     }
 
-    // 2) 后端检索:多路在范围内纯按 embedding 得分取前 rerankCandidates(后端 RRF 融合,不套阈值),排除窗口内叶子
+    // 2) 后端检索:多路在范围内纯按 embedding 得分取前 rerankCandidates(后端 max 融合,不套阈值),排除窗口内叶子
     const exclude = windowLeafIds(chat);
+    const selfScope = currentChatScope();
     const { results } = await vecSearch(database, scopes, queryVectors, {
       topK: Math.max(1, cfg.rerankCandidates),
       excludeLeafIds: exclude,
     });
+    setRecallEmbedding(
+      results.map(h => ({
+        leafId: h.leafId,
+        similarity: h.similarity,
+        queryIndex: h.queryIndex ?? -1,
+        source: sourceLabel(h, selfScope),
+        storyTime: compactTimeLabel((h.storyTime || '').trim()),
+        preview: previewOf(h.document),
+      })),
+    );
     if (!results.length) {
+      setRecallStatus('未召回:检索无候选');
       clearRecallInjection();
       return;
     }
@@ -113,15 +155,44 @@ export async function runVectorRecall(signal?: AbortSignal): Promise<void> {
     // 3) rerank(用 INTENT/重写 query;渠道未配 → 降级:用 embedding 序,score 复用 similarity)
     const ranked = await rerankCandidates(rerankQuery, results, signal);
 
-    // 4) 分档 + 上限
-    const text = buildRecallText(ranked, cfg);
+    // 4) 分档 + 上限(now = 故事内最新时间,作相对时间参照点,对齐历史摘要注入)
+    const now = latestStoryTime(chat);
+    const { text, tiers } = buildRecallText(ranked, cfg, selfScope, now);
+    recordRerankDebug(ranked, tiers, selfScope);
     fn(RECALL_INJECT_KEY, text, IN_CHAT, RECALL_INJECT_DEPTH, false, ROLE_SYSTEM, null);
+    setRecallInjected(text);
+    setRecallStatus(text ? '召回完成' : '召回完成:无内容达标,本回合未注入');
   } catch (e) {
     console.warn('[柏宝书向量] 召回失败(降级为不召回):', e);
+    setRecallStatus(`失败:${e instanceof Error ? e.message : String(e)}`);
     clearRecallInjection();
   } finally {
     recalling = false;
   }
+}
+
+/** 把分档结果写入调试快照:按 leaf_id 去重(保留首条),tier 取 buildRecallText 标记,缺省 drop。 */
+function recordRerankDebug(
+  ranked: RankedHit[],
+  tiers: Map<string, 'full' | 'brief'>,
+  selfScope: string | null,
+): void {
+  const seen = new Set<string>();
+  const hits: RecallDebugRerankHit[] = [];
+  for (const h of ranked) {
+    if (seen.has(h.leafId)) continue;
+    seen.add(h.leafId);
+    hits.push({
+      leafId: h.leafId,
+      rerankScore: h.rerankScore,
+      similarity: h.similarity,
+      tier: tiers.get(h.leafId) ?? 'drop',
+      source: sourceLabel(h, selfScope),
+      storyTime: compactTimeLabel((h.storyTime || '').trim()),
+      preview: previewOf(h.document),
+    });
+  }
+  setRecallRerank(hits);
 }
 
 /**
@@ -133,6 +204,7 @@ async function resolveQueryVectors(
   signal?: AbortSignal,
 ): Promise<{ queryVectors: string[]; rerankQuery: string }> {
   const { intent, queries } = await rewriteQuery(signal);
+  setRecallRewrite(intent, queries);
   if (!queries.length) throw new Error('查询重写未产出任何 query');
   // 检索向量:多条 Q(INTENT 偏长偏全文,留给 rerank,不进检索向量以免稀释)
   const vecs = await embedTexts(queries, signal);
@@ -174,9 +246,17 @@ async function rerankCandidates(query: string, hits: VecHit[], signal?: AbortSig
  *  - 全文档:rerankScore ≥ rerankThreshold,取前 fullTextCount,发 mes_full(无则退 document)。
  *  - 摘要档:rerankScore < rerankThreshold 但 similarity ≥ embeddingThreshold,发 document。
  *  - 总数 ≤ finalRecallCount;按 leaf_id 去重(已在后端跨 scope 合并,这里再兜底)。
+ *
+ * 返回拼好的注入文本 + 每条被采纳叶子的分档(full/brief),供调试面板标注 tier。
  */
-function buildRecallText(ranked: RankedHit[], cfg: typeof apiSettings.vector.recall): string {
+function buildRecallText(
+  ranked: RankedHit[],
+  cfg: typeof apiSettings.vector.recall,
+  selfScope: string | null,
+  now: string,
+): { text: string; tiers: Map<string, 'full' | 'brief'> } {
   const seen = new Set<string>();
+  const tiers = new Map<string, 'full' | 'brief'>();
   const fullChunks: string[] = [];
   const briefChunks: string[] = [];
   let fullUsed = 0;
@@ -192,26 +272,47 @@ function buildRecallText(ranked: RankedHit[], cfg: typeof apiSettings.vector.rec
       const body = (h.mesFull || h.document || '').trim();
       if (!body) continue;
       seen.add(h.leafId);
+      tiers.set(h.leafId, 'full');
       fullUsed++;
       // mesFull 自带 (起始时间…)/(结束时间…),不再加 【】头避免时间重复;退到 document 时才补头
-      fullChunks.push(fmtChunk(h, body, useMesFull));
+      fullChunks.push(fmtChunk(h, body, useMesFull, selfScope, now));
     } else if (h.similarity >= cfg.embeddingThreshold) {
       const body = (h.document || '').trim();
       if (!body) continue;
       seen.add(h.leafId);
-      briefChunks.push(fmtChunk(h, body, false)); // 摘要档无内嵌时间,补 【】头
+      tiers.set(h.leafId, 'brief');
+      briefChunks.push(fmtChunk(h, body, false, selfScope, now)); // 摘要档无内嵌时间,补 【(相对) 区间】头
     }
     // 两档都不达标:丢弃
   }
 
   const chunks = [...fullChunks, ...briefChunks];
-  if (!chunks.length) return '';
-  return `[相关回忆]\n${chunks.join('\n\n')}`;
+  if (!chunks.length) return { text: '', tiers };
+  return { text: `[相关回忆]\n${chunks.join('\n\n')}`, tiers };
 }
 
-/** 单条召回片段:body 未自带内嵌时间时补一个故事时间 【】头(若有)。 */
-function fmtChunk(h: RankedHit, body: string, bodyHasInlineTime: boolean): string {
-  if (bodyHasInlineTime) return body;
-  const t = (h.storyTime || '').trim();
-  return t ? `【${t}】${body}` : body;
+/**
+ * 把索引时存的「未压缩起止段」格式化成展示用时间头:【(相对) 起 - 止】。
+ *  - 压缩成区间显示(compactTimeLabel:删结束端重复日期);
+ *  - 用结束时间相对「现在」(故事内最新时间 now)算相对前缀(对齐历史摘要的 inject.ts)。
+ * 无时间 → 空串。
+ */
+function fmtStoryTimeHead(storyTime: string, now: string): string {
+  const t = storyTime.trim();
+  if (!t) return '';
+  const shown = compactTimeLabel(t);
+  const end = splitTimeLabel(t).end ?? '';
+  const rel = relativeTimeLabel(end, now);
+  return rel ? `【(${rel}) ${shown}】` : `【${shown}】`;
+}
+
+/**
+ * 单条召回片段:行首加来源标记(本聊天「#5」/ 旧档),让主模型知道这段回忆出处;
+ * body 未自带内嵌时间时再补一个故事时间头【(相对) 起 - 止】(若有)。
+ */
+function fmtChunk(h: RankedHit, body: string, bodyHasInlineTime: boolean, selfScope: string | null, now: string): string {
+  const src = `[${sourceLabel(h, selfScope)}]`;
+  if (bodyHasInlineTime) return `${src} ${body}`;
+  const head = fmtStoryTimeHead(h.storyTime || '', now);
+  return head ? `${src}${head}${body}` : `${src} ${body}`;
 }

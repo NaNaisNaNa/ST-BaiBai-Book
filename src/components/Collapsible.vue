@@ -69,7 +69,9 @@ const expanded = ref(props.open);
   color: var(--bbs-ink-muted);
   transition: transform var(--bbs-dur) var(--bbs-ease);
 }
-.bbs-collapsible.is-open .bbs-collapsible-chevron {
+/* 用直接子代 > 限定:嵌套 Collapsible 时,外层 .is-open 不得波及内层的 outer/chevron,
+   否则内层会被外层钉死在展开态、永远收不起来。 */
+.bbs-collapsible.is-open > .bbs-collapsible-head .bbs-collapsible-chevron {
   transform: rotate(180deg);
 }
 
@@ -79,7 +81,7 @@ const expanded = ref(props.open);
   grid-template-rows: 0fr;
   transition: grid-template-rows var(--bbs-dur) var(--bbs-ease);
 }
-.bbs-collapsible.is-open .bbs-collapsible-outer {
+.bbs-collapsible.is-open > .bbs-collapsible-outer {
   grid-template-rows: 1fr;
 }
 .bbs-collapsible-inner {

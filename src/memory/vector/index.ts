@@ -13,7 +13,7 @@
 
 import { getContext, type STMessage } from '@/st/context';
 import { apiSettings, engineActiveHere } from '@/api/settings';
-import { isBaiBaoKuAvailable, vecReconcile, vecUpsert, type VecItem } from '@/api/baibaoku';
+import { isBaiBaoKuAvailable, vecClearScope, vecReconcile, vecUpsert, type VecItem } from '@/api/baibaoku';
 import { getLeaf, leafValid, stripHtml } from '../apply';
 import { resolveKeepStart } from '../engine';
 import { clampToTimeTags, inlineTimeTags } from '../timeTag';
@@ -49,6 +49,18 @@ interface LeafForIndex {
   msgIndex: number;
 }
 
+/**
+ * 叶子的故事时间,存为**未压缩**的完整起止段「起 - 止」(起止相同/缺一端则单点)。
+ * 为何不压缩(不删结束端重复日期):召回端要从这串里拆回**完整结束时间**算相对时间,
+ * 压缩后结束端会缺日期(如「06:55」)导致算不出相对。显示时召回端再 compactTimeLabel 压成区间。
+ */
+function leafStoryTime(leaf: LeafExtra): string {
+  const start = leaf.timeStart?.trim() || '';
+  const end = leaf.timeEnd?.trim() || '';
+  if (start && end) return start === end ? start : `${start} - ${end}`;
+  return start || end || leaf.timeLabel?.trim() || '';
+}
+
 /** 扫当前 chat 收集所有有效叶子的索引素材。 */
 function collectLeaves(chat: STMessage[]): LeafForIndex[] {
   const out: LeafForIndex[] = [];
@@ -62,7 +74,7 @@ function collectLeaves(chat: STMessage[]): LeafForIndex[] {
       docHash: docHashOf(document),
       document,
       mesFull: cleanMesFull(chat[i].mes),
-      storyTime: leaf.timeEnd?.trim() || leaf.timeStart?.trim() || leaf.timeLabel?.trim() || '',
+      storyTime: leafStoryTime(leaf),
       msgIndex: i,
     });
   }
@@ -176,6 +188,21 @@ export async function ensureRecallIndex(signal?: AbortSignal): Promise<void> {
   } finally {
     indexing = false;
   }
+}
+
+/**
+ * 清空当前聊天的向量索引(只清 chat:<chatId> scope,不动继承的 bundle 快照)。
+ * 用于「索引脏了/想重来」:清空后可用「重建」从头索引。返回删除条数。
+ * 不走 vectorIndexableHere 闸门(用户手动操作,即便向量开关临时关也应允许清理),
+ * 但仍需当前库+聊天 id 才有目标 scope。
+ */
+export async function clearVectorIndex(): Promise<number> {
+  const database = currentVectorDb();
+  const chatId = currentChatId();
+  if (!database || !chatId) return 0;
+  if (!(await isBaiBaoKuAvailable())) throw new Error('柏宝库后端不可用');
+  const { deleted } = await vecClearScope(database, `chat:${chatId}`);
+  return deleted;
 }
 
 /** 防抖触发索引同步:叶子生成/编辑/删除后调用,合并连续变动为一次。 */

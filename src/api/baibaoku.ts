@@ -25,6 +25,8 @@ export interface VecHit {
   leafId: string;
   scope: string;
   similarity: number;
+  /** 取得最佳相似度的 query 下标(来源 Q);旧后端未回传时为 -1 */
+  queryIndex: number;
   document: string;
   mesFull: string | null;
   storyTime: string | null;

@@ -13,7 +13,8 @@ import {
   type PromptMacro,
 } from '@/memory/prompts';
 import { TIME_TAG_PROMPT } from '@/memory/timeTag';
-import { syncVectorIndex } from '@/memory/vector';
+import { clearVectorIndex, syncVectorIndex } from '@/memory/vector';
+import { recallDebug } from '@/memory/vector/debug';
 import { computeCarryoverPlan, createNewChatWithCarryover, type CarryoverPlan } from '@/memory/carryover';
 import { ui, THEMES, type NavPosition } from '@/state/ui';
 import { computed, nextTick, ref } from 'vue';
@@ -330,6 +331,28 @@ async function doRebuildIndex() {
   }
 }
 
+// 清空当前聊天向量索引:破坏性操作,点一次先要二次确认,再点才真清。
+const vecClearing = ref(false);
+const vecClearConfirm = ref(false);
+async function doClearIndex() {
+  if (vecClearing.value) return;
+  if (!vecClearConfirm.value) {
+    vecClearConfirm.value = true;
+    return;
+  }
+  vecClearConfirm.value = false;
+  vecClearing.value = true;
+  vecIndexMsg.value = '';
+  try {
+    const n = await clearVectorIndex();
+    vecIndexMsg.value = `已清空当前聊天向量索引(删除 ${n} 条)。可点「重建」从头索引。`;
+  } catch (e) {
+    vecIndexMsg.value = `清空失败:${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    vecClearing.value = false;
+  }
+}
+
 /* —— 带数据创建新对话 —— */
 const carrying = ref(false);
 const carryMsg = ref('');
@@ -408,6 +431,31 @@ function insertMacro(token: string) {
     const pos = start + token.length;
     el.setSelectionRange(pos, pos);
   });
+}
+
+/* —— 上次召回详情(调试面板):纯只读展示 recallDebug,reactive 自动刷新 —— */
+function fmtRecallTime(at: number): string {
+  if (!at) return '';
+  const d = new Date(at);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+// 来源 Q 标签:后端回传 -1(旧后端未支持)时显示占位符
+function qLabel(queryIndex: number): string {
+  return queryIndex >= 0 ? `Q${queryIndex + 1}` : '—';
+}
+const TIER_LABEL: Record<'full' | 'brief' | 'drop', string> = { full: '全文', brief: '摘要', drop: '丢弃' };
+// 状态语气:决定横幅左侧圆点的配色(成功/警示/失败/进行中)
+const recallStatusKind = computed<'ok' | 'warn' | 'fail' | 'pending'>(() => {
+  const s = recallDebug.status;
+  if (s.includes('失败')) return 'fail';
+  if (s.includes('进行中')) return 'pending';
+  if (s.includes('未召回') || s.includes('未注入')) return 'warn';
+  return 'ok';
+});
+// 分数(0~1)→ 进度条宽度百分比;负分(如未知)按 0 处理
+function scorePct(score: number): number {
+  return Math.max(0, Math.min(1, score)) * 100;
 }
 </script>
 
@@ -775,17 +823,97 @@ function insertMacro(token: string) {
           <div class="bbs-vec-head"><span class="bbs-field-label">索引维护</span></div>
           <p class="bbs-field-hint">
             正常情况下叶子摘要会随生成自动索引;若中途才开启向量记忆,可手动把当前聊天已有的摘要补建进向量库。
+            清空只删当前聊天自己的索引,不动「带数据建新对话」继承来的旧档快照。
           </p>
-          <button
-            class="bbs-btn bbs-btn-sm"
-            type="button"
-            :disabled="!apiSettings.vector.enabled || vecIndexing"
-            @click="doRebuildIndex"
-          >
-            {{ vecIndexing ? '索引中…' : '重建当前聊天向量索引' }}
-          </button>
+          <div class="bbs-vec-index-actions">
+            <button
+              class="bbs-btn bbs-btn-sm"
+              type="button"
+              :disabled="!apiSettings.vector.enabled || vecIndexing || vecClearing"
+              @click="doRebuildIndex"
+            >
+              {{ vecIndexing ? '索引中…' : '重建当前聊天向量索引' }}
+            </button>
+            <button
+              class="bbs-btn bbs-btn-sm bbs-btn-danger"
+              type="button"
+              :disabled="!apiSettings.vector.enabled || vecIndexing || vecClearing"
+              @click="doClearIndex"
+              @blur="vecClearConfirm = false"
+            >
+              <Icon name="trash" />
+              {{ vecClearing ? '清空中…' : vecClearConfirm ? '再点确认清空' : '清空当前聊天索引' }}
+            </button>
+          </div>
           <p v-if="vecIndexMsg" class="bbs-field-hint">{{ vecIndexMsg }}</p>
         </div>
+
+        <hr class="bbs-rule" />
+
+        <!-- 上次召回详情:把上一次召回各阶段的中间结果可视化,便于调参/排障(reactive 自动刷新) -->
+        <Collapsible title="上次召回详情" :open="false">
+          <p v-if="!recallDebug.at" class="bbs-field-hint">
+            尚无召回记录。配好向量渠道后发一条消息触发召回,这里会显示重写 / 检索 / 重排 / 注入各阶段结果。
+          </p>
+          <div v-else class="bbs-dbg">
+            <!-- 状态横幅:左侧圆点按语气配色,右侧时间 -->
+            <div class="bbs-dbg-banner" :class="`is-${recallStatusKind}`">
+              <span class="bbs-dbg-dot" aria-hidden="true"></span>
+              <span class="bbs-dbg-status-text">{{ recallDebug.status }}</span>
+              <span class="bbs-dbg-time">{{ fmtRecallTime(recallDebug.at) }}</span>
+            </div>
+
+            <!-- 四阶段各自可折叠,默认收起;标题带计数 -->
+            <Collapsible :title="`1 · 查询重写 · ${recallDebug.queries.length} Q`" :open="false">
+              <p v-if="recallDebug.intent" class="bbs-dbg-intent">
+                <span class="bbs-dbg-tag">INTENT</span><span class="bbs-dbg-intent-text">{{ recallDebug.intent }}</span>
+              </p>
+              <ul v-if="recallDebug.queries.length" class="bbs-dbg-qlist">
+                <li v-for="(q, i) in recallDebug.queries" :key="i" class="bbs-dbg-qitem">
+                  <span class="bbs-dbg-qno">Q{{ i + 1 }}</span><span class="bbs-dbg-qtext">{{ q }}</span>
+                </li>
+              </ul>
+              <p v-else class="bbs-dbg-empty">无</p>
+            </Collapsible>
+
+            <Collapsible :title="`2 · Embedding 检索 · ${recallDebug.embedding.length} 条`" :open="false">
+              <ul v-if="recallDebug.embedding.length" class="bbs-dbg-cards">
+                <li v-for="(h, i) in recallDebug.embedding" :key="i" class="bbs-dbg-card">
+                  <div class="bbs-dbg-card-top">
+                    <span class="bbs-dbg-src" :title="`来源 ${qLabel(h.queryIndex)}`">{{ qLabel(h.queryIndex) }}</span>
+                    <span class="bbs-dbg-from" :class="{ 'is-bundle': h.source === '旧档' }">{{ h.source }}</span>
+                    <span v-if="h.storyTime" class="bbs-dbg-when">【{{ h.storyTime }}】</span>
+                    <span class="bbs-dbg-num">{{ h.similarity.toFixed(3) }}</span>
+                  </div>
+                  <div class="bbs-dbg-bar"><i :style="{ width: scorePct(h.similarity) + '%' }"></i></div>
+                  <p class="bbs-dbg-prev">{{ h.preview }}</p>
+                </li>
+              </ul>
+              <p v-else class="bbs-dbg-empty">无</p>
+            </Collapsible>
+
+            <Collapsible :title="`3 · Rerank 分档 · ${recallDebug.rerank.length} 条`" :open="false">
+              <ul v-if="recallDebug.rerank.length" class="bbs-dbg-cards">
+                <li v-for="(h, i) in recallDebug.rerank" :key="i" class="bbs-dbg-card" :class="{ 'is-dropped': h.tier === 'drop' }">
+                  <div class="bbs-dbg-card-top">
+                    <span class="bbs-dbg-tier" :class="`is-${h.tier}`">{{ TIER_LABEL[h.tier] }}</span>
+                    <span class="bbs-dbg-from" :class="{ 'is-bundle': h.source === '旧档' }">{{ h.source }}</span>
+                    <span v-if="h.storyTime" class="bbs-dbg-when">【{{ h.storyTime }}】</span>
+                    <span class="bbs-dbg-num">{{ h.rerankScore.toFixed(3) }}</span>
+                  </div>
+                  <div class="bbs-dbg-bar" :class="`tier-${h.tier}`"><i :style="{ width: scorePct(h.rerankScore) + '%' }"></i></div>
+                  <p class="bbs-dbg-prev">{{ h.preview }}</p>
+                </li>
+              </ul>
+              <p v-else class="bbs-dbg-empty">无(rerank 未执行或无候选)</p>
+            </Collapsible>
+
+            <Collapsible title="4 · 最终注入" :open="false">
+              <pre v-if="recallDebug.injectedText" class="bbs-dbg-pre">{{ recallDebug.injectedText }}</pre>
+              <p v-else class="bbs-dbg-empty">本回合未注入。</p>
+            </Collapsible>
+          </div>
+        </Collapsible>
       </Collapsible>
 
       <!-- 带数据创建新对话 -->
@@ -1469,6 +1597,280 @@ function insertMacro(token: string) {
   border: 1px solid var(--bbs-line);
   border-radius: 999px;
   white-space: nowrap;
+}
+
+/* —— 上次召回详情(调试面板):状态横幅 + 步骤分区 + 分数条卡片 —— */
+.bbs-dbg {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* 状态横幅:左色点 + 文案 + 时间 */
+.bbs-dbg-banner {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 12px;
+  border-radius: var(--bbs-radius-sm);
+  background: var(--bbs-surface-2);
+  border-left: 3px solid var(--bbs-line-strong);
+}
+.bbs-dbg-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--bbs-ink-muted);
+}
+.bbs-dbg-banner.is-ok {
+  border-left-color: var(--bbs-accent);
+}
+.bbs-dbg-banner.is-ok .bbs-dbg-dot {
+  background: var(--bbs-accent);
+}
+.bbs-dbg-banner.is-warn {
+  border-left-color: var(--bbs-warning);
+}
+.bbs-dbg-banner.is-warn .bbs-dbg-dot {
+  background: var(--bbs-warning);
+}
+.bbs-dbg-banner.is-fail {
+  border-left-color: var(--bbs-danger);
+}
+.bbs-dbg-banner.is-fail .bbs-dbg-dot {
+  background: var(--bbs-danger);
+}
+.bbs-dbg-banner.is-pending .bbs-dbg-dot {
+  background: var(--bbs-ink-soft);
+}
+.bbs-dbg-status-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--bbs-ink);
+  word-break: break-word;
+}
+.bbs-dbg-time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--bbs-ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.bbs-dbg-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--bbs-ink-muted);
+}
+
+/* 索引维护:重建/清空按钮并排,窄屏自动换行 */
+.bbs-vec-index-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+/* 重写:INTENT 高亮 + Q 列表 */
+.bbs-dbg-intent {
+  display: flex;
+  gap: 7px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: var(--bbs-radius-sm);
+  background: var(--bbs-accent-soft);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.bbs-dbg-intent-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--bbs-ink);
+  word-break: break-word;
+}
+.bbs-dbg-tag {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  padding: 1px 6px;
+  border-radius: var(--bbs-radius-sm);
+  background: var(--bbs-accent);
+  color: var(--bbs-accent-ink);
+  font-family: var(--bbs-font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+.bbs-dbg-qlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bbs-dbg-qitem {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--bbs-ink);
+}
+.bbs-dbg-qno {
+  flex: 0 0 auto;
+  min-width: 22px;
+  font-family: var(--bbs-font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--bbs-accent);
+}
+.bbs-dbg-qtext {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+
+/* 命中卡片列表:固定高度内滑动,长列表不把折叠区撑得很长。 */
+.bbs-dbg-cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.bbs-dbg-card {
+  padding: 8px 10px;
+  border: 1px solid var(--bbs-line);
+  border-radius: var(--bbs-radius-sm);
+  background: var(--bbs-surface-2);
+}
+.bbs-dbg-card.is-dropped {
+  opacity: 0.55;
+}
+.bbs-dbg-card-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+/* 来源 Q 徽标 */
+.bbs-dbg-src {
+  flex: 0 0 auto;
+  min-width: 26px;
+  text-align: center;
+  padding: 1px 7px;
+  border-radius: var(--bbs-radius-pill);
+  background: var(--bbs-accent-soft);
+  color: var(--bbs-accent);
+  font-family: var(--bbs-font-mono);
+  font-size: 11px;
+  font-weight: 700;
+}
+/* 来源标记:本聊天楼层号(中性)/ 旧档(描边提示色) */
+.bbs-dbg-from {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: var(--bbs-radius-pill);
+  font-family: var(--bbs-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--bbs-ink-soft);
+  background: var(--bbs-surface);
+  border: 1px solid var(--bbs-line-strong);
+}
+.bbs-dbg-from.is-bundle {
+  color: var(--bbs-warning);
+  background: var(--bbs-warning-soft);
+  border-color: transparent;
+}
+.bbs-dbg-when {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--bbs-ink-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bbs-dbg-num {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-family: var(--bbs-font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bbs-ink);
+  font-variant-numeric: tabular-nums;
+}
+/* 分数条:细轨 + 填充;默认强调色,rerank 各档分色 */
+.bbs-dbg-bar {
+  height: 4px;
+  border-radius: var(--bbs-radius-pill);
+  background: var(--bbs-line);
+  overflow: hidden;
+}
+.bbs-dbg-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--bbs-accent);
+  transition: width var(--bbs-dur) var(--bbs-ease);
+}
+.bbs-dbg-bar.tier-brief > i {
+  background: var(--bbs-ink-soft);
+}
+.bbs-dbg-bar.tier-drop > i {
+  background: var(--bbs-ink-muted);
+}
+.bbs-dbg-prev {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--bbs-ink-muted);
+  word-break: break-word;
+}
+/* 分档徽标:全文(强调实底)/摘要(中性)/丢弃(描边褪色) */
+.bbs-dbg-tier {
+  flex: 0 0 auto;
+  min-width: 32px;
+  text-align: center;
+  padding: 1px 8px;
+  border-radius: var(--bbs-radius-pill);
+  font-size: 11px;
+  font-weight: 700;
+}
+.bbs-dbg-tier.is-full {
+  color: var(--bbs-accent-ink);
+  background: var(--bbs-accent);
+}
+.bbs-dbg-tier.is-brief {
+  color: var(--bbs-ink-soft);
+  background: var(--bbs-surface);
+  border: 1px solid var(--bbs-line-strong);
+}
+.bbs-dbg-tier.is-drop {
+  color: var(--bbs-ink-muted);
+  background: transparent;
+  border: 1px solid var(--bbs-line);
+}
+/* 注入文本框:等宽、限高滚动 */
+.bbs-dbg-pre {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 320px;
+  overflow: auto;
+  background: var(--bbs-surface-2);
+  border: 1px solid var(--bbs-line);
+  border-radius: var(--bbs-radius-sm);
+  font-family: var(--bbs-font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--bbs-ink);
 }
 
 /* —— 自定义提示词列表 —— */
