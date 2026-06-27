@@ -34,7 +34,10 @@ export type TaskType = 'summary' | 'resummary';
 /** 自定义提示词:空串表示沿用 prompts.ts 内置模板,非空则整体覆盖该任务的模板。 */
 export interface CustomPrompts {
   summary: string;
+  /** 普通总结(L0 叶子 → L1):把多条楼层摘要压成一条 L1 总结。 */
   resummary: string;
+  /** 二次总结(L1+ → 更上层):把多条总结再压一层,字数按输入规模动态放宽以少丢信息。 */
+  resummary2: string;
   /** 破限提示词:附加在摘要/总结请求里;空串=不附加。 */
   jailbreak: string;
   /** 固定提示词(时间标签):注入**主对话**模型,要求每条正文前后输出时间标签;空=用内置默认。 */
@@ -147,7 +150,7 @@ function defaults(): ApiSettings {
   return {
     enabled: true,
     ui: { theme: 'day', navPosition: 'auto', navTapClose: true },
-    prompts: { summary: '', resummary: '', jailbreak: '', timeTag: '' },
+    prompts: { summary: '', resummary: '', resummary2: '', jailbreak: '', timeTag: '' },
     vector: {
       enabled: false,
       // 默认填硅基流动地址 + 各角色模型,用户只需在 embedding 填一次 key 即可跑通:

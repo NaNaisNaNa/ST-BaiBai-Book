@@ -6,6 +6,8 @@ import { apiSettings, newChannel, resolveVectorModel, type ApiChannel } from '@/
 import { getContext } from '@/st/context';
 import {
   JAILBREAK_PROMPT,
+  RESUMMARY2_MACROS,
+  RESUMMARY2_PROMPT,
   RESUMMARY_MACROS,
   RESUMMARY_PROMPT,
   SUMMARY_MACROS,
@@ -180,7 +182,7 @@ function closeModelMenuSoon() {
 }
 
 /* —— 自定义提示词:列表(摘要/总结/破限/时间标签),点开在弹窗里编辑大文本 —— */
-type PromptKey = 'summary' | 'resummary' | 'jailbreak' | 'timeTag';
+type PromptKey = 'summary' | 'resummary' | 'resummary2' | 'jailbreak' | 'timeTag';
 interface PromptMeta {
   key: PromptKey;
   label: string;
@@ -199,9 +201,16 @@ const PROMPT_METAS: PromptMeta[] = [
   {
     key: 'resummary',
     label: '总结提示词',
-    hint: '把多条楼层摘要压缩成一条更上层的总结。',
+    hint: '把多条楼层摘要压成一条 L1 总结(普通总结,固定 300-500 字)。',
     builtin: RESUMMARY_PROMPT,
     macros: RESUMMARY_MACROS,
+  },
+  {
+    key: 'resummary2',
+    label: '二次总结提示词',
+    hint: '把多条总结再压一层(L1+ → 更上层)。目标字数按输入规模动态放宽({{target}}),少丢信息。',
+    builtin: RESUMMARY2_PROMPT,
+    macros: RESUMMARY2_MACROS,
   },
   {
     key: 'jailbreak',

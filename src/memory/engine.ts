@@ -731,7 +731,8 @@ export async function checkResummary(): Promise<number> {
 
     const batch = roots.slice(0, threshold);
     const content = batch.map((s, i) => `[${i + 1}] ${s.text}`).join('\n\n');
-    const prompt = buildResummaryPrompt({ user: ctx.name1, char: ctx.name2, content });
+    // 传**输出层级**(level+1):L1(普通总结,300-500字)/ L2+(二次总结,字数随输入动态)
+    const prompt = buildResummaryPrompt({ user: ctx.name1, char: ctx.name2, content, level: level + 1 });
 
     try {
       const jb = apiSettings.prompts.jailbreak.trim() || JAILBREAK_PROMPT;
