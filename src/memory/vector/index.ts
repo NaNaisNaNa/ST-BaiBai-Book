@@ -13,7 +13,8 @@
 
 import { getContext, type STMessage } from '@/st/context';
 import { apiSettings, engineActiveHere } from '@/api/settings';
-import { isBaiBaoKuAvailable, vecClearScope, vecReconcile, vecUpsert, type VecItem } from '@/api/baibaoku';
+import type { VecItem } from '@/api/baibaoku';
+import { resetVectorStoreProbe, vecClearScope, vecReconcile, vecUpsert } from './store';
 import { getLeaf, leafValid, stripHtml } from '../apply';
 import { resolveKeepStart } from '../engine';
 import { clampToTimeTags, inlineTimeTags } from '../timeTag';
@@ -108,8 +109,6 @@ export async function syncVectorIndex(signal?: AbortSignal): Promise<number> {
 
   indexing = true;
   try {
-    if (!(await isBaiBaoKuAvailable())) return 0;
-
     const leaves = collectLeaves(chat);
     const present = leaves.map(l => ({ leafId: l.leafId, docHash: l.docHash }));
 
@@ -171,8 +170,6 @@ export async function ensureRecallIndex(signal?: AbortSignal): Promise<void> {
 
   indexing = true;
   try {
-    if (!(await isBaiBaoKuAvailable())) return;
-
     const leaves = collectLeaves(chat);
     const present = leaves.map(l => ({ leafId: l.leafId, docHash: l.docHash }));
     const { missing } = await vecReconcile(database, scope, present);
@@ -200,7 +197,7 @@ export async function clearVectorIndex(): Promise<number> {
   const database = currentVectorDb();
   const chatId = currentChatId();
   if (!database || !chatId) return 0;
-  if (!(await isBaiBaoKuAvailable())) throw new Error('柏宝库后端不可用');
+  resetVectorStoreProbe(); // 手动维护前重测后端,后端刚就绪/刚停都能切到对的 store
   const { deleted } = await vecClearScope(database, `chat:${chatId}`);
   return deleted;
 }

@@ -2,8 +2,14 @@
 import Icon from '@/components/Icon.vue';
 import { PAGES } from '@/pages/registry';
 import { closeBook, ui } from '@/state/ui';
+import { updateState } from '@/memory/update';
 
 const props = defineProps<{ placement: 'top' | 'bottom'; narrow?: boolean }>();
+
+// 设置页有可用更新时,在「设置」导航项上亮一个红点角标(提示用户进设置页更新)。
+function showUpdateDot(id: string): boolean {
+  return id === 'settings' && updateState.available;
+}
 
 // 移动端:再点一下当前页的导航按钮即关闭整窗(省得去够右上角的 ×);非当前页正常切页。
 // 受 ui.navTapClose 开关控制(默认开,怕误触的用户可在设置里关)。
@@ -29,7 +35,11 @@ function onNavClick(id: string) {
       :aria-current="ui.activePage === p.id ? 'page' : undefined"
       @click="onNavClick(p.id)"
     >
-      <Icon :name="p.id" class="bbs-nav-icon" />
+      <span class="bbs-nav-icon-wrap">
+        <Icon :name="p.id" class="bbs-nav-icon" />
+        <!-- 有可用更新:设置项亮红点角标 -->
+        <span v-if="showUpdateDot(p.id)" class="bbs-nav-dot" aria-label="有可用更新"></span>
+      </span>
       <!-- 底部导航仅图标,顶部带文字 -->
       <span v-if="placement === 'top'" class="bbs-nav-label">{{ p.label }}</span>
     </button>
@@ -108,5 +118,24 @@ function onNavClick(id: string) {
   outline: 2px solid var(--bbs-accent);
   outline-offset: 2px;
   border-radius: var(--bbs-radius-sm);
+}
+
+/* —— 更新红点角标:挂在图标右上角 —— */
+.bbs-nav-icon-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.bbs-nav-dot {
+  position: absolute;
+  top: -2px;
+  right: -3px;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--bbs-radius-pill);
+  background: var(--bbs-danger);
+  box-shadow: 0 0 0 1.5px var(--bbs-surface);
+  pointer-events: none;
 }
 </style>

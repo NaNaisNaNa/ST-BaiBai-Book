@@ -16,10 +16,12 @@ import {
 } from '@/memory/prompts';
 import { TIME_TAG_PROMPT } from '@/memory/timeTag';
 import { clearVectorIndex, syncVectorIndex } from '@/memory/vector';
+import { resetVectorStoreProbe, vectorBackendKind } from '@/memory/vector/store';
+import { checkForUpdate, performUpdate, updateState } from '@/memory/update';
 import { recallDebug } from '@/memory/vector/debug';
 import { computeCarryoverPlan, createNewChatWithCarryover, type CarryoverPlan } from '@/memory/carryover';
 import { ui, THEMES, type NavPosition } from '@/state/ui';
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, onMounted, ref } from 'vue';
 
 const navOptions: { value: NavPosition; label: string }[] = [
   { value: 'auto', label: '自动' },
@@ -323,6 +325,36 @@ function closeVecModelMenuSoon() {
   }, 150);
 }
 
+/* —— 向量后端类型:'backend' 柏宝库后端 / 'local' 本地降级;探测一次,展示当前在用哪个。 —— */
+const vecBackend = ref<'backend' | 'local' | 'unknown'>('unknown');
+async function refreshVecBackend(): Promise<void> {
+  try {
+    vecBackend.value = await vectorBackendKind();
+  } catch {
+    vecBackend.value = 'unknown';
+  }
+}
+onMounted(refreshVecBackend);
+
+/* —— 检测更新:版本区块 + 确认弹窗 —— */
+const updateConfirmOpen = ref(false);
+// 进设置页时静默重查一次(force:绕开「会话只查一次」,让用户每次进设置页都拿最新结论)
+onMounted(() => void checkForUpdate(true));
+function openUpdateConfirm() {
+  if (updateState.available) updateConfirmOpen.value = true;
+}
+async function confirmUpdate() {
+  updateConfirmOpen.value = false;
+  const toastr = (globalThis as Record<string, any>).toastr;
+  try {
+    await performUpdate();
+    // performUpdate 成功后会自动刷新页面;走到这里通常是已触发刷新倒计时
+    toastr?.success?.('更新成功,正在刷新页面…', '柏宝书');
+  } catch (e) {
+    toastr?.error?.(`更新失败:${e instanceof Error ? e.message : String(e)}`, '柏宝书');
+  }
+}
+
 /* —— 索引维护:手动重建当前聊天向量索引 —— */
 const vecIndexing = ref(false);
 const vecIndexMsg = ref('');
@@ -330,6 +362,7 @@ async function doRebuildIndex() {
   if (vecIndexing.value) return;
   vecIndexing.value = true;
   vecIndexMsg.value = '';
+  resetVectorStoreProbe(); // 重测后端,确保索引落到当前真实可用的 store
   try {
     const n = await syncVectorIndex();
     vecIndexMsg.value = n > 0 ? `已索引 ${n} 条新摘要。` : '没有需要新增的索引(已是最新)。';
@@ -337,6 +370,7 @@ async function doRebuildIndex() {
     vecIndexMsg.value = `索引失败:${e instanceof Error ? e.message : String(e)}`;
   } finally {
     vecIndexing.value = false;
+    void refreshVecBackend();
   }
 }
 
@@ -359,6 +393,7 @@ async function doClearIndex() {
     vecIndexMsg.value = `清空失败:${e instanceof Error ? e.message : String(e)}`;
   } finally {
     vecClearing.value = false;
+    void refreshVecBackend();
   }
 }
 
@@ -470,7 +505,31 @@ function scorePct(score: number): number {
 
 <template>
   <section class="bbs-page">
-    <h2 class="bbs-title bbs-title-sub">设置</h2>
+    <!-- 标题行右端显示版本号;有更新时旁边出现「更新」按钮。 -->
+    <div class="bbs-page-head">
+      <h2 class="bbs-title bbs-title-sub">设置</h2>
+      <div class="bbs-ver-row">
+        <button
+          class="bbs-ver"
+          type="button"
+          :disabled="updateState.checking"
+          :title="updateState.checking ? '正在检查更新' : '点击检查更新'"
+          @click="checkForUpdate(true)"
+        >
+          v{{ updateState.current || '—' }}
+        </button>
+        <button
+          v-if="updateState.available"
+          class="bbs-btn bbs-btn-primary bbs-btn-sm"
+          type="button"
+          :disabled="updateState.updating"
+          :title="`更新到 v${updateState.latest}`"
+          @click="openUpdateConfirm"
+        >
+          {{ updateState.updating ? '更新中…' : '更新' }}
+        </button>
+      </div>
+    </div>
     <hr class="bbs-rule" />
 
     <!-- 总开关:整个插件的主控,关闭即停止注入/摘要/总结/隐藏(已有数据保留)。
@@ -842,10 +901,22 @@ function scorePct(score: number): number {
 
         <!-- 索引维护:把当前聊天的叶子摘要补建/对账进向量库 -->
         <div class="bbs-vec-recall" :class="{ 'is-disabled': !apiSettings.vector.enabled }">
-          <div class="bbs-vec-head"><span class="bbs-field-label">索引维护</span></div>
+          <div class="bbs-vec-head">
+            <span class="bbs-field-label">索引维护</span>
+            <span
+              v-if="vecBackend !== 'unknown'"
+              class="bbs-vec-backend"
+              :class="vecBackend === 'backend' ? 'is-backend' : 'is-local'"
+            >
+              {{ vecBackend === 'backend' ? '柏宝库' : '前端' }}
+            </span>
+          </div>
           <p class="bbs-field-hint">
             正常情况下叶子摘要会随生成自动索引;若中途才开启向量记忆,可手动把当前聊天已有的摘要补建进向量库。
             清空只删当前聊天自己的索引,不动「带数据建新对话」继承来的旧档快照。
+          </p>
+          <p v-if="vecBackend === 'local'" class="bbs-field-hint">
+            本地模式:索引存浏览器,仅当前聊天召回,不跨聊天 / 不跨设备。安装柏宝库后端后可恢复完整能力。
           </p>
           <div class="bbs-vec-index-actions">
             <button
@@ -1176,6 +1247,26 @@ function scorePct(score: number): number {
         </footer>
       </div>
     </div>
+
+    <!-- ===== 更新确认弹窗 ===== -->
+    <div v-if="updateConfirmOpen" class="bbs-modal-mask" @click.self="updateConfirmOpen = false">
+      <div class="bbs-modal bbs-modal-confirm" role="dialog" aria-modal="true" aria-label="确认更新">
+        <header class="bbs-modal-head">
+          <span class="bbs-modal-title">发现新版本</span>
+        </header>
+        <p class="bbs-confirm-text">
+          当前版本 v{{ updateState.current || '—' }},最新版本 v{{ updateState.latest }}。<br />
+          现在更新吗?更新完成后会自动刷新页面生效。
+        </p>
+        <footer class="bbs-modal-foot">
+          <span class="bbs-modal-foot-spacer"></span>
+          <button class="bbs-btn" type="button" @click="updateConfirmOpen = false">取消</button>
+          <button class="bbs-btn bbs-btn-primary" type="button" :disabled="updateState.updating" @click="confirmUpdate">
+            {{ updateState.updating ? '更新中…' : '更新并刷新' }}
+          </button>
+        </footer>
+      </div>
+    </div>
   </section>
 </template>
 
@@ -1188,6 +1279,43 @@ function scorePct(score: number): number {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+/* —— 标题行:左标题 + 右版本号(及更新按钮) —— */
+.bbs-page-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.bbs-ver-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+/* 版本标签:实心强调底 + 白字(粉彩=粉底白字,各主题随 --bbs-accent 自适应) */
+.bbs-ver {
+  border: 0;
+  padding: 7px 12px;
+  border-radius: var(--bbs-radius-pill);
+  background: var(--bbs-accent);
+  color: var(--bbs-accent-ink);
+  cursor: pointer;
+  font-family: var(--bbs-font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  transition: opacity var(--bbs-dur) var(--bbs-ease);
+}
+.bbs-ver:hover {
+  opacity: 0.88;
+}
+.bbs-ver:disabled {
+  cursor: default;
+}
+.bbs-ver:focus-visible {
+  outline: 2px solid var(--bbs-accent);
+  outline-offset: 2px;
 }
 
 .bbs-field {
@@ -1625,6 +1753,29 @@ function scorePct(score: number): number {
   border: 1px solid var(--bbs-line);
   border-radius: 999px;
   white-space: nowrap;
+}
+/* 向量后端类型标签:与摘要列表的「总结」标签同款(实心填充、白字),后端=强调色,本地降级=警告色 */
+.bbs-vec-backend {
+  box-sizing: border-box;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: var(--bbs-radius-sm);
+  white-space: nowrap;
+}
+.bbs-vec-backend.is-backend {
+  color: var(--bbs-accent-ink);
+  background: var(--bbs-accent);
+  border: 1px solid var(--bbs-accent);
+}
+.bbs-vec-backend.is-local {
+  color: var(--bbs-accent-ink);
+  background: var(--bbs-warning);
+  border: 1px solid var(--bbs-warning);
 }
 
 /* —— 上次召回详情(调试面板):状态横幅 + 步骤分区 + 分数条卡片 —— */

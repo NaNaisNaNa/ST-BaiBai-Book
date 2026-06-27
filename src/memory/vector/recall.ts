@@ -15,7 +15,8 @@
 
 import { getContext, type STMessage } from '@/st/context';
 import { apiSettings, engineActiveHere } from '@/api/settings';
-import { isBaiBaoKuAvailable, vecSearch, type VecHit } from '@/api/baibaoku';
+import type { VecHit } from '@/api/baibaoku';
+import { vecSearch } from './store';
 import { getLeaf, leafValid } from '../apply';
 import { MEMORY_BRIEFING_NOTE, MEMORY_BRIEFING_END } from '../prompts';
 import { embedTexts, encodeFloat32Base64, rerankDocuments } from './embed';
@@ -216,12 +217,6 @@ export async function runVectorRecall(signal?: AbortSignal): Promise<void> {
   try {
     // 开一次新调试快照(进入有效召回路径才记录,避免「功能未启用」时反复清空上次结果)
     resetRecallDebug();
-
-    if (!(await isBaiBaoKuAvailable())) {
-      setRecallStatus('未召回:柏宝库后端不可用');
-      clearRecallInjection();
-      return;
-    }
 
     // 召回前先补齐窗口外缺失的向量索引(载入老聊天/向量后开 → 旧叶子可能从未索引),
     // 否则这些旧剧情会直接漏召回。只阻塞窗口外,窗口内交给防抖增量。

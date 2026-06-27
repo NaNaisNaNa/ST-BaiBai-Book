@@ -4,6 +4,7 @@ import { runVectorRecall, shouldRecallForType } from '@/memory/vector/recall';
 import { refreshInjection } from '@/memory/inject';
 import { syncTimeTagRegex } from '@/memory/timeTag';
 import { bindChatLifecycle } from '@/memory/store';
+import { checkForUpdate } from '@/memory/update';
 import App from '@/App.vue';
 import { injectMenuButton } from '@/menu';
 // 这两行让 Vite 把全局样式打进 dist/index.css(随后注入 shadow root)
@@ -114,6 +115,8 @@ function bindMemoryWhenReady(attempt = 0) {
       syncTimeTagRegex();
       // 首屏:把当前聊天已有的记忆挂上注入
       refreshInjection();
+      // 后台检测更新(实时比对本地/远端 manifest 版本;失败静默,不阻断启动)
+      void checkForUpdate();
       console.log('[柏宝书] 启动链绑定完成');
     } catch (e) {
       console.error('[柏宝书] 记忆系统绑定失败', e);
