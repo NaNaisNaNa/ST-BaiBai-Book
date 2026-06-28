@@ -23,6 +23,23 @@ export const engineState = reactive({
   lastRunAt: 0,
 });
 
+/**
+ * 批量补摘运行状态(模块级单例,供 UI 跨「关窗重开」恢复进度/取消按钮)。
+ * 放这里而非组件本地 ref:柏宝书窗口关闭会销毁组件、丢失本地 ref,但 batchBackfill 在本模块继续跑——
+ * 关窗 ≠ 取消。重开后组件读这个单例即可恢复「补摘中 X/Y + 取消」的显示。
+ */
+export const batchState = reactive({
+  running: false,
+  done: 0,
+  total: 0,
+  cancelRequested: false, // 用户已点取消、等块边界生效
+});
+
+/** 请求取消正在进行的批量补摘(块边界生效,不打断进行中的块)。 */
+export function cancelBatchBackfill(): void {
+  if (batchState.running) batchState.cancelRequested = true;
+}
+
 let busy = false;
 // 当前在飞的摘要完成信号:拦截器可 await 它(成功/失败都 resolve,永不 reject,故不会卡死生成)。
 // 无在飞摘要时为 null。在 runSummary 头尾维护。
@@ -723,14 +740,10 @@ async function runSummaryInner(aiFloor: number): Promise<void> {
 
 /* ============ 批量补摘(分块批量,一次请求 → 多片单楼叶子) ============ */
 
-/** 批量进度/控制选项 */
+/** 批量补摘选项 */
 export interface BatchBackfillOpts {
   /** 待补摘的 AI 楼层(由旧到新);省略则取当前所有待摘 AI 楼 */
   floors?: number[];
-  /** 进度回调:done=已落叶楼数,total=总楼数 */
-  onProgress?: (done: number, total: number) => void;
-  /** 取消查询:返回 true 则在下个块边界停止(不打断进行中的块,保证已开块落叶完整) */
-  shouldCancel?: () => boolean;
 }
 
 /** 批量结果汇总 */
@@ -902,12 +915,16 @@ export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<Batch
   busy = true;
   engineState.running = true;
   engineState.lastError = '';
+  // 批量状态(模块级单例)→ UI 跨关窗重开可恢复进度/取消
+  batchState.running = true;
+  batchState.cancelRequested = false;
+  batchState.done = 0;
+  batchState.total = total;
   let done = 0;
   let cancelled = false;
   try {
-    opts.onProgress?.(0, total);
     for (const block of batches) {
-      if (opts.shouldCancel?.()) { cancelled = true; break; }
+      if (batchState.cancelRequested) { cancelled = true; break; }
       try {
         await summarizeBatchWork(chat, block, sender);
       } catch (e) {
@@ -924,7 +941,7 @@ export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<Batch
       }
       // 本块产出的已落叶楼计入进度(只数确实落上叶子的,失败楼不计)
       done = floors.filter(f => leafValid(chat[f])).length;
-      opts.onProgress?.(done, total);
+      batchState.done = done;
     }
     // 连锁触发总结(可能跨多层),失败写 lastError 不影响已落叶子
     await checkResummary();
@@ -933,6 +950,8 @@ export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<Batch
   } finally {
     busy = false;
     engineState.running = false;
+    batchState.running = false;
+    batchState.cancelRequested = false;
   }
   await afterSummaryHideAndInject(chat);
   return { done, total, cancelled };

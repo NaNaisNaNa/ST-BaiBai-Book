@@ -3,7 +3,7 @@ import Icon from '@/components/Icon.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import { appendOpToLatestLeaf, deleteLeafAt, deleteSummary, editLeafAt, editPlan, editSummary } from '@/memory/apply';
 import { apiSettings } from '@/api/settings';
-import { batchBackfill, engineState, resummarizeNow, summarizeFloor } from '@/memory/engine';
+import { batchBackfill, batchState, cancelBatchBackfill, engineState, resummarizeNow, summarizeFloor } from '@/memory/engine';
 import { refreshInjection, selectViewNodes, type ViewNode } from '@/memory/inject';
 import { compactTimeLabel, formatRange, splitTimeLabel } from '@/memory/timeTag';
 import { relativeTimeLabel } from '@/memory/timeRel';
@@ -110,40 +110,23 @@ async function summarizeOne(floor: number) {
 
 /* ============ 批量补摘 ============
  * 把所有未摘楼层按内容量分块、逐块串行补摘:省 token(固定上下文按块分摊)+ 减请求数。
- * 先弹确认(显示待摘楼数),执行中显示进度 + 可取消(块边界生效)。 */
+ * 先弹确认(显示待摘楼数),执行中显示进度 + 可取消(块边界生效)。
+ * 运行状态读 engine 的 batchState 单例(非组件本地 ref):关掉柏宝书窗口再重开,
+ * 进度条与取消按钮能恢复——因为任务在 engine 里继续跑,关窗不取消。 */
 const batchConfirmOpen = ref(false);
-const batchRunning = ref(false);
-const batchDone = ref(0);
-const batchTotal = ref(0);
-let batchCancelFlag = false;
 
 function openBatchConfirm() {
   if (engineState.running || !pendingFloors.value.length) return;
   batchConfirmOpen.value = true;
 }
-async function runBatchBackfill() {
+function runBatchBackfill() {
   batchConfirmOpen.value = false;
   if (engineState.running) return;
-  batchCancelFlag = false;
-  batchRunning.value = true;
-  batchDone.value = 0;
-  batchTotal.value = pendingFloors.value.length;
-  try {
-    await batchBackfill({
-      // 由旧到新补;pendingFloors 是倒序展示用,这里传升序更稳(引擎内部也会再过滤排序)
-      floors: [...derivedMeta.pendingFloors].sort((a, b) => a - b),
-      onProgress: (done, total) => {
-        batchDone.value = done;
-        batchTotal.value = total;
-      },
-      shouldCancel: () => batchCancelFlag,
-    });
-  } finally {
-    batchRunning.value = false;
-  }
-}
-function cancelBatch() {
-  batchCancelFlag = true;
+  // 不 await:任务在 engine 里跑,状态走 batchState 单例;UI 只读它,不依赖本函数停留
+  void batchBackfill({
+    // 由旧到新补;pendingFloors 是倒序展示用,这里传升序更稳(引擎内部也会再过滤排序)
+    floors: [...derivedMeta.pendingFloors].sort((a, b) => a - b),
+  });
 }
 
 /* ============ 立即总结 ============
@@ -436,7 +419,7 @@ function saveEdit() {
         </span>
         <!-- 批量补摘:把全部未摘楼层分块串行补完(省 token、减请求);批量进行中显示进度+取消 -->
         <button
-          v-if="!batchRunning"
+          v-if="!batchState.running"
           class="bbs-btn bbs-btn-sm bbs-batch-btn"
           type="button"
           :disabled="engineState.running || summarizingFloor !== null"
@@ -447,9 +430,9 @@ function saveEdit() {
         </button>
         <span v-else class="bbs-batch-progress">
           <span class="bbs-pending-spin"></span>
-          补摘中 {{ batchDone }}/{{ batchTotal }}
-          <button class="bbs-batch-cancel" type="button" :disabled="batchCancelFlag" @click="cancelBatch">
-            {{ batchCancelFlag ? '停止中…' : '取消' }}
+          补摘中 {{ batchState.done }}/{{ batchState.total }}
+          <button class="bbs-batch-cancel" type="button" :disabled="batchState.cancelRequested" @click="cancelBatchBackfill">
+            {{ batchState.cancelRequested ? '停止中…' : '取消' }}
           </button>
         </span>
       </div>
@@ -459,7 +442,7 @@ function saveEdit() {
           :key="f"
           class="bbs-pending-chip"
           type="button"
-          :disabled="engineState.running || summarizingFloor !== null || batchRunning"
+          :disabled="engineState.running || summarizingFloor !== null || batchState.running"
           :title="`对楼层 #${f} 生成摘要`"
           @click="summarizeOne(f)"
         >
@@ -1110,13 +1093,12 @@ function saveEdit() {
   border: 1px solid var(--bbs-accent); /* 与 loc 同样有 1px 边框,保证两者等高 */
 }
 /* 楼层号/收纳数:描边定位标签;tabular 数字对齐。
-   纯数字(#6)无下伸笔画、墨迹偏上,盒子居中也压不正,下推 2px 让数字视觉居中。 */
+   不加 margin —— 它会把整个盒子下推、与同行的相对时间标签错位;盒子对齐优先于字形微调。 */
 .bbs-summary-loc {
   color: var(--bbs-ink-soft);
   background: var(--bbs-surface-2);
   border: 1px solid var(--bbs-line);
   font-variant-numeric: tabular-nums;
-  margin-top: 2px;
 }
 .bbs-summary-time {
   font-size: 12px;
