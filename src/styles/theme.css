@@ -157,3 +157,34 @@
   background-position: center;
   background-size: 14px;
 }
+
+/* ========== 绿色 ========== */
+.bbs-root[data-theme='green'] {
+  --bbs-bg: #F0F6F8;
+  /* Pale, misty lake blue */
+  --bbs-surface: #FFFFFF;
+  --bbs-surface-2: #E0EFE8;
+  /* Soft seafoam green for highlights */
+  --bbs-ink: #2C4A52;
+  /* Deep slate-teal for reading */
+  --bbs-ink-soft: #638289;
+  --bbs-ink-muted: #95AEB4;
+  --bbs-accent: #529E93;
+  /* Gentle blue-green aquamarine */
+  --bbs-accent-soft: #529E9326;
+  /* 15% opacity */
+  --bbs-accent-ink: #FFFFFF;
+  --bbs-line: #BFE3DF;
+  --bbs-line-strong: #8AC2BB;
+  --bbs-danger: #D47979;
+  /* Soft coral */
+  --bbs-danger-soft: #D4797926;
+  /* 15% opacity */
+  --bbs-warning: #D9B76B;
+  /* Warm sand */
+  --bbs-warning-soft: #D9B76B26;
+  /* 15% opacity */
+  --bbs-overlay: #2C4A5266;
+  /* 40% deep teal overlay */
+  --bbs-shadow: 0 20px 56px -22px #32646033, 0 4px 14px -8px #3264601A;
+}
