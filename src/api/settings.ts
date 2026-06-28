@@ -132,6 +132,10 @@ export interface ApiSettings {
   resummaryThreshold: number;
   /** 摘要/总结失败(请求报错或 JSON 解析失败)的最大重试次数。0=不重试;默认 1(最多再试一次)。 */
   summaryMaxRetries: number;
+  /** 批量补摘:每批最大正文字符数(清洗后)。攒够即切块,控制单次请求规模(防 AI 注意力涣散)。 */
+  batchMaxChars: number;
+  /** 批量补摘:每批最大楼数兜底。即便字符没到上限,楼数到此也切块。 */
+  batchMaxFloors: number;
 }
 
 // extension_settings 里的命名空间键;localStorage 是旧版残留,仅用于一次性迁移。
@@ -182,6 +186,8 @@ function defaults(): ApiSettings {
     leafBatchThreshold: 12,
     resummaryThreshold: 7,
     summaryMaxRetries: 1,
+    batchMaxChars: 8000,
+    batchMaxFloors: 10,
   };
 }
 
@@ -224,6 +230,15 @@ function normalize(raw: unknown): ApiSettings {
     Number.isFinite(merged.summaryMaxRetries) && merged.summaryMaxRetries >= 0
       ? Math.floor(merged.summaryMaxRetries)
       : 1;
+  // 批量补摘参数:正整数,缺失/非法回退默认值(下限 1,避免 0 导致永不切块/死循环)
+  merged.batchMaxChars =
+    Number.isFinite(merged.batchMaxChars) && merged.batchMaxChars >= 500
+      ? Math.floor(merged.batchMaxChars)
+      : 8000;
+  merged.batchMaxFloors =
+    Number.isFinite(merged.batchMaxFloors) && merged.batchMaxFloors >= 1
+      ? Math.floor(merged.batchMaxFloors)
+      : 10;
   return merged;
 }
 
@@ -282,6 +297,8 @@ function applyInto(target: ApiSettings, src: ApiSettings): void {
   target.leafBatchThreshold = src.leafBatchThreshold;
   target.resummaryThreshold = src.resummaryThreshold;
   target.summaryMaxRetries = src.summaryMaxRetries;
+  target.batchMaxChars = src.batchMaxChars;
+  target.batchMaxFloors = src.batchMaxFloors;
 }
 
 /** 写回 extension_settings 并防抖落盘到服务器(跨设备同步的关键)。 */

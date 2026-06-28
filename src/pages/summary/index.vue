@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import Icon from '@/components/Icon.vue';
+import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import { appendOpToLatestLeaf, deleteLeafAt, deleteSummary, editLeafAt, editPlan, editSummary } from '@/memory/apply';
 import { apiSettings } from '@/api/settings';
-import { engineState, resummarizeNow, summarizeFloor } from '@/memory/engine';
+import { batchBackfill, engineState, resummarizeNow, summarizeFloor } from '@/memory/engine';
 import { refreshInjection, selectViewNodes, type ViewNode } from '@/memory/inject';
 import { compactTimeLabel, formatRange, splitTimeLabel } from '@/memory/timeTag';
 import { relativeTimeLabel } from '@/memory/timeRel';
@@ -105,6 +106,44 @@ async function summarizeOne(floor: number) {
   } finally {
     summarizingFloor.value = null;
   }
+}
+
+/* ============ 批量补摘 ============
+ * 把所有未摘楼层按内容量分块、逐块串行补摘:省 token(固定上下文按块分摊)+ 减请求数。
+ * 先弹确认(显示待摘楼数),执行中显示进度 + 可取消(块边界生效)。 */
+const batchConfirmOpen = ref(false);
+const batchRunning = ref(false);
+const batchDone = ref(0);
+const batchTotal = ref(0);
+let batchCancelFlag = false;
+
+function openBatchConfirm() {
+  if (engineState.running || !pendingFloors.value.length) return;
+  batchConfirmOpen.value = true;
+}
+async function runBatchBackfill() {
+  batchConfirmOpen.value = false;
+  if (engineState.running) return;
+  batchCancelFlag = false;
+  batchRunning.value = true;
+  batchDone.value = 0;
+  batchTotal.value = pendingFloors.value.length;
+  try {
+    await batchBackfill({
+      // 由旧到新补;pendingFloors 是倒序展示用,这里传升序更稳(引擎内部也会再过滤排序)
+      floors: [...derivedMeta.pendingFloors].sort((a, b) => a - b),
+      onProgress: (done, total) => {
+        batchDone.value = done;
+        batchTotal.value = total;
+      },
+      shouldCancel: () => batchCancelFlag,
+    });
+  } finally {
+    batchRunning.value = false;
+  }
+}
+function cancelBatch() {
+  batchCancelFlag = true;
 }
 
 /* ============ 立即总结 ============
@@ -389,18 +428,38 @@ function saveEdit() {
     </div>
     <p v-if="resummaryHint" class="bbs-resummary-hint">{{ resummaryHint }}</p>
 
-    <!-- 未摘要楼层:只列楼层号,点一下单独补摘那一楼 -->
+    <!-- 未摘要楼层:只列楼层号,点一下单独补摘那一楼;楼层多时可「批量补摘」 -->
     <div v-if="pendingFloors.length" class="bbs-pending">
-      <span class="bbs-pending-label" :data-count="pendingFloors.length">
-        <Icon name="summary" />未摘要楼层
-      </span>
+      <div class="bbs-pending-head">
+        <span class="bbs-pending-label" :data-count="pendingFloors.length">
+          <Icon name="summary" />未摘要楼层
+        </span>
+        <!-- 批量补摘:把全部未摘楼层分块串行补完(省 token、减请求);批量进行中显示进度+取消 -->
+        <button
+          v-if="!batchRunning"
+          class="bbs-btn bbs-btn-sm bbs-batch-btn"
+          type="button"
+          :disabled="engineState.running || summarizingFloor !== null"
+          title="把全部未摘楼层分批一次性补完(比逐楼省 token、更快)"
+          @click="openBatchConfirm"
+        >
+          <Icon name="plans" />批量补摘
+        </button>
+        <span v-else class="bbs-batch-progress">
+          <span class="bbs-pending-spin"></span>
+          补摘中 {{ batchDone }}/{{ batchTotal }}
+          <button class="bbs-batch-cancel" type="button" :disabled="batchCancelFlag" @click="cancelBatch">
+            {{ batchCancelFlag ? '停止中…' : '取消' }}
+          </button>
+        </span>
+      </div>
       <div class="bbs-pending-chips">
         <button
           v-for="f in pendingFloors"
           :key="f"
           class="bbs-pending-chip"
           type="button"
-          :disabled="engineState.running || summarizingFloor !== null"
+          :disabled="engineState.running || summarizingFloor !== null || batchRunning"
           :title="`对楼层 #${f} 生成摘要`"
           @click="summarizeOne(f)"
         >
@@ -409,6 +468,17 @@ function saveEdit() {
         </button>
       </div>
     </div>
+
+    <!-- 批量补摘确认弹窗 -->
+    <ConfirmDialog
+      v-model:open="batchConfirmOpen"
+      title="批量补摘"
+      confirmText="开始"
+      @confirm="runBatchBackfill"
+    >
+      共 {{ pendingFloors.length }} 个未摘楼层,将按内容量分批、逐批串行补摘(比逐楼省 token、更快)。
+      过程中可随时取消(会在当前这批完成后停下)。继续?
+    </ConfirmDialog>
 
     <!-- 当前状态 -->
     <div v-if="currentTime || memory.state.location" class="bbs-state">
@@ -831,6 +901,12 @@ function saveEdit() {
   border-radius: var(--bbs-radius);
   background: var(--bbs-accent-soft);
 }
+/* 标题行:标签靠左,批量补摘按钮/进度推到右侧 */
+.bbs-pending-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
 .bbs-pending-label {
   display: inline-flex;
   align-items: center;
@@ -838,6 +914,51 @@ function saveEdit() {
   font-size: 13px;
   font-weight: 600;
   color: var(--bbs-accent);
+}
+/* 批量补摘按钮:推到标题行最右,小一号带图标 */
+.bbs-batch-btn {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  font-size: 12px;
+}
+/* 批量进行中的进度块:旋转环 + 进度文字 + 取消键 */
+.bbs-batch-progress {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bbs-accent);
+  font-variant-numeric: tabular-nums;
+}
+.bbs-batch-progress .bbs-pending-spin {
+  width: 12px;
+  height: 12px;
+}
+.bbs-batch-cancel {
+  padding: 3px 9px;
+  border: 1px solid var(--bbs-line-strong);
+  border-radius: var(--bbs-radius-sm);
+  background: var(--bbs-surface);
+  color: var(--bbs-ink-soft);
+  font-size: 11px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.bbs-batch-cancel:hover:not(:disabled) {
+  color: var(--bbs-danger);
+  border-color: var(--bbs-danger);
+  background: var(--bbs-danger-soft);
+}
+.bbs-batch-cancel:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 /* 标签后跟一枚计数小点,强化「有 N 楼待办」 */
 .bbs-pending-label::after {

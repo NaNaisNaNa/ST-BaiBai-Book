@@ -11,6 +11,7 @@
 
 import { apiSettings } from '@/api/settings';
 import { getContext, type STMessage } from '@/st/context';
+import type { LeafExtra } from './types';
 
 /** 标签固定标识(解析正则与隐藏正则都依赖它) */
 export const START_TAG = 'bbs_start';
@@ -52,23 +53,42 @@ export function parseTimeRange(mes: string): { start?: string; end?: string } {
 }
 
 /**
- * 当前「故事内最新时间」:从 chat 末尾往前扫,取第一条能从正文标签解析出的时间(end 优先,缺则 start)。
+ * 当前「故事内最新时间」:从 chat 末尾往前扫,取第一条解析得到的时间(end 优先,缺则 start)。
  *
  * 为什么不直接用派生的 memory.state.time:那个只重放「已生成叶子」的楼层,最新几层没摘时就停在旧值。
  * 而最新 AI 楼正文里本就带 <bbs_end>,这里直接读它,无论摘没摘都拿到真实最新时间。
+ *
+ * 取值优先级(每条消息):① 正文 <bbs_start>/<bbs_end> 标签(最权威,不受是否已摘影响);
+ *   ② 标签缺失时回退到该楼叶子的 timeEnd/timeStart —— 覆盖「旧聊天补摘」场景:那些楼正文里
+ *   没有时间标签(用插件前生成的),但补摘已把时间写进叶子。少了这个兜底,整页相对时间会因
+ *   参照点(now)为空而全部不显示。
  * 用途:① 摘要页「当前时间」展示;② 历史摘要注入时相对时间的参照点(「现在」)。
- * 解析不到(纯架空/无标签)→ 返回空串,调用方各自回退。
+ * 全部解析不到(纯架空/无标签且无叶子)→ 返回空串,调用方各自回退。
  */
 export function latestStoryTime(chat: STMessage[] | null): string {
   if (!chat) return '';
   for (let i = chat.length - 1; i >= 0; i--) {
     const m = chat[i];
     if (typeof m?.mes !== 'string' || !m.mes) continue;
+    // ① 正文标签优先
     const { start, end } = parseTimeRange(clampToTimeTags(m.mes));
-    const t = end || start;
-    if (t) return t;
+    const tagTime = end || start;
+    if (tagTime) return tagTime;
+    // ② 标签缺失 → 回退该楼有效叶子的时间(旧聊天补摘:正文无标签但叶子有时间)
+    const leaf = m.extra?.bbs_leaf as LeafExtra | undefined;
+    if (leaf?.id && leaf.delta && leafSwipeMatches(leaf, m)) {
+      const leafTime = leaf.timeEnd?.trim() || leaf.timeStart?.trim();
+      if (leafTime) return leafTime;
+    }
   }
   return '';
+}
+
+/** 叶子页码是否匹配当前 swipe(与 apply.leafValid 同口径;内联避免 timeTag↔apply 循环依赖)。 */
+function leafSwipeMatches(leaf: LeafExtra, m: STMessage): boolean {
+  const leafSwipe = typeof leaf.swipe === 'number' ? leaf.swipe : 0;
+  const msgSwipe = typeof m.swipe_id === 'number' ? m.swipe_id : 0;
+  return leafSwipe === msgSwipe;
 }
 
 /**

@@ -8,7 +8,7 @@ import { toast } from '@/st/toast';
 import { addSummary, deriveMemory, finalizeDelta, getLeaf, itemChangesOf, leafValid, makeLeafId, pruneBrokenComps, stripHtml, syncItemLogFromMessage } from './apply';
 import { extractJsonObject } from './json';
 import { clearInjection, refreshInjection, renderHistoryNodes, selectHistoryNodesBefore } from './inject';
-import { buildCharCardSystem, buildResummaryPrompt, buildSummaryPrompt, buildWorldInfoSystem, fmtItemLogInline, JAILBREAK_PROMPT, THINKING_CHECKLIST, THINKING_PREFILL } from './prompts';
+import { buildBatchSummaryPrompt, buildBatchThinking, buildCharCardSystem, buildResummaryPrompt, buildSummaryPrompt, buildWorldInfoSystem, fmtItemLogInline, JAILBREAK_PROMPT, THINKING_CHECKLIST, THINKING_PREFILL } from './prompts';
 import { clampToTimeTags, inlineTimeTags, parseTimeRange, syncTimeTagRegex, writeItemLogTag } from './timeTag';
 import { memory, recomputeDerived, scheduleLeafFlush } from './store';
 import type { LeafExtra, SummaryDelta } from './types';
@@ -559,6 +559,137 @@ export function runSummary(aiFloor: number): Promise<void> {
   return p;
 }
 
+/**
+ * 求某 AI 楼的「覆盖范围」(喂模型的上下文楼段):本 AI 楼 + 它前面紧邻的、尚未覆盖的(用户)楼层。
+ * 碰到已覆盖楼或上一个 AI 楼即停。单楼与批量共用,保证两路径喂给模型的正文段一致。
+ */
+function floorTargets(chat: STMessage[], aiFloor: number, covered: Set<number>): number[] {
+  const targets: number[] = [aiFloor];
+  for (let i = aiFloor - 1; i >= 0; i--) {
+    if (covered.has(i)) break;
+    if (isAiFloor(chat[i])) break; // 碰到上一个 AI 楼层就停
+    if (chat[i]) targets.unshift(i);
+  }
+  return targets;
+}
+
+/**
+ * 把一份 AI delta 固化成叶子并落到某 AI 楼(单楼与批量共用,保证两路径落叶口径一致)。
+ *  - 时间:优先读该楼正文 <bbs_start>/<bbs_end> 标签(权威锚点);缺的那端用 AI 补的兜底。
+ *  - plans.resolve 短序号 → 稳定 id:用传入的 stateBefore(本楼之前状态)的未了结计划顺序翻译。
+ *  - 物品净变动写进正文 <bbs_items> 旁注(基准 = stateBefore.items)。
+ * 不做 recompute/flush/注入——由调用方在合适时机统一收尾(批量可攒到块尾一次刷新)。
+ */
+function applyLeafForFloor(
+  chat: STMessage[],
+  aiFloor: number,
+  delta: SummaryDelta,
+  stateBefore: ReturnType<typeof deriveMemory>,
+): void {
+  // 时间锚点:从该楼正文标签读起止(先裁剪到正文段,跳过思维链/状态栏里混入的同名标签)
+  const tag = parseTimeRange(clampToTimeTags(chat[aiFloor].mes));
+
+  // 未了结计划的有序列表:顺序即提示词里的 p1/p2…,用于把 resolve 短序号翻译成稳定 id
+  const openPlansOrdered = stateBefore.plans.filter(p => p.status === 'open');
+  const storedDelta = finalizeDelta(delta, openPlansOrdered);
+
+  // 时间起止:标签优先(与新剧情同源不漂移);标签缺的那端用 AI 补的 timeStart/timeEnd 兜底。
+  const timeStart = tag.start || delta.timeStart?.trim() || undefined;
+  const timeEnd = tag.end || delta.timeEnd?.trim() || delta.time?.trim() || undefined;
+  // 状态当前时间(覆盖型):用结束时间(本段最后时刻);取不到则保留既有状态。
+  if (timeEnd) storedDelta.time = timeEnd;
+
+  const leaf: LeafExtra = {
+    id: makeLeafId(),
+    text: (delta.summary ?? '').trim(),
+    delta: storedDelta,
+    timeStart,
+    timeEnd,
+    createdAt: Date.now(),
+    // 记录生成时所在页码,供 leafValid 判定归属(翻到别页时不串扰);缺 swipe_id 按第一页 0
+    swipe: typeof chat[aiFloor].swipe_id === 'number' ? chat[aiFloor].swipe_id : 0,
+    v: 1,
+  };
+  chat[aiFloor].extra = { ...(chat[aiFloor].extra ?? {}), bbs_leaf: leaf };
+
+  // 把本楼物品净变动写进正文 </bbs_end> 之后(<bbs_items> 旁注,正则隐藏、不进副API摘要)。
+  // 用 stateBefore.items(本楼之前的物品)作基准算 from→to;无变动则只清旧块。
+  const changes = itemChangesOf(storedDelta, stateBefore.items, timeEnd || timeStart || '');
+  chat[aiFloor].mes = writeItemLogTag(chat[aiFloor].mes, fmtItemLogInline(changes));
+}
+
+/**
+ * 单楼摘要的「纯工作」部分:发请求 + 解析 + 落叶 + 刷新派生/注入。
+ * **不管理 busy / 不做守卫 / 不触发 checkResummary**——由调用方(runSummaryInner 或批量回退)负责。
+ * 失败(请求报错 / JSON 无效)直接抛出,调用方决定如何处理。
+ */
+async function summarizeFloorWork(
+  chat: STMessage[],
+  aiFloor: number,
+  sender: { send: (messages: ChatMsg[]) => Promise<string>; label: string },
+): Promise<void> {
+  const ctx = getContext();
+  if (!ctx) throw new Error('无 ST 上下文');
+
+  const covered = coveredSet(chat);
+  const targets = floorTargets(chat, aiFloor, covered);
+  const content = renderMessages(chat, targets, ctx.name1, ctx.name2);
+
+  // 两端标签齐才算「有标签」,提示词据此免去 AI 算时间。
+  const tag = parseTimeRange(clampToTimeTags(chat[aiFloor].mes));
+  const hasTimeTags = !!(tag.start && tag.end);
+
+  // 截止到「被分析楼段之前」的状态与历史(不泄漏未来:重摘早期楼时排除其后叶子)
+  const beforeIndex = targets[0];
+  const stateBefore = deriveMemory(chat, beforeIndex);
+  const history = renderHistoryNodes(selectHistoryNodesBefore(memory.summaries, chat, beforeIndex));
+
+  const worldInfo = await fetchWorldInfo(chat, targets, ctx.name1, ctx.name2);
+  const charCard = fetchCharCard();
+
+  const openPlansOrdered = stateBefore.plans.filter(p => p.status === 'open');
+  const prompt = buildSummaryPrompt({
+    user: ctx.name1,
+    char: ctx.name2,
+    time: stateBefore.state.time,
+    location: stateBefore.state.location,
+    items: stateBefore.items.map(i => ({ name: i.name, qty: i.qty, desc: i.desc, carried: i.carried, location: i.location })),
+    itemLog: stateBefore.itemLog,
+    openPlans: openPlansOrdered.map(p => ({ kind: p.kind, content: p.content, createdTime: p.createdTime, targetTime: p.targetTime })),
+    history,
+    content,
+    hasTimeTags,
+  });
+
+  const messages: ChatMsg[] = [];
+  const jb = apiSettings.prompts.jailbreak.trim() || JAILBREAK_PROMPT;
+  if (jb) messages.push({ role: 'system', content: jb });
+  if (charCard) messages.push({ role: 'system', content: buildCharCardSystem(charCard) });
+  if (worldInfo) messages.push({ role: 'system', content: buildWorldInfoSystem(worldInfo) });
+  messages.push(
+    { role: 'user', content: prompt },
+    { role: 'system', content: THINKING_CHECKLIST },
+    { role: 'assistant', content: THINKING_PREFILL },
+  );
+  const delta = await sendAndParse(sender.send, messages, raw => {
+    console.log('[柏宝书] 摘要原始返回(未清洗):\n', raw);
+    const d = extractJsonObject<SummaryDelta>(raw);
+    if (!d || !d.summary) {
+      throw new Error(raw.trim() ? '摘要失败:AI道歉或掉格式' : '摘要失败:AI空回');
+    }
+    return d as SummaryDelta & { summary: string };
+  });
+
+  applyLeafForFloor(chat, aiFloor, delta, stateBefore);
+  engineState.lastRunAt = Date.now();
+
+  // 立刻反映到派生与注入;落盘走防抖(隐藏由收尾的 syncWindowHiddenState 统一负责)
+  recomputeDerived();
+  refreshInjection();
+  scheduleLeafFlush();
+  scheduleVectorIndex(); // 新叶子 → 防抖同步进向量库(失败静默,不影响摘要)
+}
+
 async function runSummaryInner(aiFloor: number): Promise<void> {
   console.log('[柏宝书] runSummary 楼层', aiFloor, '| busy =', busy);
   if (!engineActiveHere()) { console.log('[柏宝书] runSummary 早退:插件总开关关闭或当前角色被排除'); return; }
@@ -575,111 +706,11 @@ async function runSummaryInner(aiFloor: number): Promise<void> {
   if (!isAiFloor(chat[aiFloor])) { console.log('[柏宝书] runSummary 早退:非 AI 楼', aiFloor); return; }
   console.log('[柏宝书] runSummary 即将发请求,', sender.label);
 
-  // 覆盖范围(喂模型的上下文):本 AI 楼层 + 它前面紧邻的、尚未覆盖的(用户)楼层
-  const covered = coveredSet(chat);
-  const targets: number[] = [aiFloor];
-  for (let i = aiFloor - 1; i >= 0; i--) {
-    if (covered.has(i)) break;
-    if (isAiFloor(chat[i])) break; // 碰到上一个 AI 楼层就停
-    if (chat[i]) targets.unshift(i);
-  }
-
   busy = true;
   engineState.running = true;
   engineState.lastError = '';
   try {
-    const content = renderMessages(chat, targets, ctx.name1, ctx.name2);
-
-    // 时间锚点:先从正文标签读起止时间(权威源)。两端都齐才算「有标签」,提示词据此免去 AI 算时间。
-    // 先裁剪到正文段再解析,跳过思维链/状态栏里可能混入的同名标签。
-    const tag = parseTimeRange(clampToTimeTags(chat[aiFloor].mes));
-    const hasTimeTags = !!(tag.start && tag.end);
-
-    // 截止到「被分析楼段之前」的状态与历史(不泄漏未来:重摘早期楼时排除其后叶子)
-    const beforeIndex = targets[0];
-    const stateBefore = deriveMemory(chat, beforeIndex);
-    const history = renderHistoryNodes(selectHistoryNodesBefore(memory.summaries, chat, beforeIndex));
-
-    // 世界书:按本轮文本激活相关条目(含 constant 常驻),给摘要模型设定依据,避免与世界观矛盾
-    const worldInfo = await fetchWorldInfo(chat, targets, ctx.name1, ctx.name2);
-    // 角色卡描述:有些卡人设写在角色描述而非世界书里,一并带上(空/群聊自动跳过)
-    const charCard = fetchCharCard();
-
-    // 未了结计划的有序列表:顺序即提示词里的 p1/p2…,用于把 AI 的 resolve 短序号翻译成稳定 id
-    const openPlansOrdered = stateBefore.plans.filter(p => p.status === 'open');
-    const prompt = buildSummaryPrompt({
-      user: ctx.name1,
-      char: ctx.name2,
-      time: stateBefore.state.time,
-      location: stateBefore.state.location,
-      items: stateBefore.items.map(i => ({ name: i.name, qty: i.qty, desc: i.desc, carried: i.carried, location: i.location })),
-      // 变动日志已随 deriveMemory(chat, beforeIndex) 截断到本段之前,不泄漏未来
-      itemLog: stateBefore.itemLog,
-      openPlans: openPlansOrdered.map(p => ({ kind: p.kind, content: p.content, createdTime: p.createdTime, targetTime: p.targetTime })),
-      history,
-      content,
-      hasTimeTags,
-    });
-
-    // 组装:破限(置顶)→ 角色设定 + 世界设定(各独立 system,有才加)→ 主提示 → 思考清单 → assistant 预填。
-    // 破限留空=用内置默认(与摘要/总结提示词同一回退语义);确实不想要可在设置里删成默认后再清。
-    const messages: ChatMsg[] = [];
-    const jb = apiSettings.prompts.jailbreak.trim() || JAILBREAK_PROMPT;
-    if (jb) messages.push({ role: 'system', content: jb });
-    if (charCard) messages.push({ role: 'system', content: buildCharCardSystem(charCard) });
-    if (worldInfo) messages.push({ role: 'system', content: buildWorldInfoSystem(worldInfo) });
-    messages.push(
-      { role: 'user', content: prompt },
-      { role: 'system', content: THINKING_CHECKLIST },
-      { role: 'assistant', content: THINKING_PREFILL },
-    );
-    // 发请求 + 解析,失败按设置重试(请求报错或 JSON 无效/缺 summary 都算失败)
-    const delta = await sendAndParse(sender.send, messages, raw => {
-      console.log('[柏宝书] 摘要原始返回(未清洗):\n', raw);
-      const d = extractJsonObject<SummaryDelta>(raw);
-      if (!d || !d.summary) {
-        // 有文本但抽不出所需格式 = AI 道歉/掉格式;整段空白 = AI 空回
-        throw new Error(raw.trim() ? '摘要失败:AI道歉或掉格式' : '摘要失败:AI空回');
-      }
-      return d as SummaryDelta & { summary: string };
-    });
-
-    // 固化 delta(resolve 短序号→稳定 plan id),写成叶子挂到 AI 楼的 extra(随消息/swipe 跟随)
-    const storedDelta = finalizeDelta(delta, openPlansOrdered);
-
-    // 时间起止:标签优先(权威锚点,与新剧情同源不漂移);标签缺的那端用 AI 补的 timeStart/timeEnd 兜底。
-    const timeStart = tag.start || delta.timeStart?.trim() || undefined;
-    const timeEnd = tag.end || delta.timeEnd?.trim() || delta.time?.trim() || undefined;
-    // 状态当前时间(覆盖型):用结束时间(本段最后时刻);取不到则保留既有状态。
-    if (timeEnd) storedDelta.time = timeEnd;
-
-    const leaf: LeafExtra = {
-      id: makeLeafId(),
-      text: delta.summary.trim(),
-      delta: storedDelta,
-      timeStart,
-      timeEnd,
-      createdAt: Date.now(),
-      // 记录生成时所在页码,供 leafValid 判定归属(翻到别页时不串扰);缺 swipe_id 按第一页 0
-      swipe: typeof chat[aiFloor].swipe_id === 'number' ? chat[aiFloor].swipe_id : 0,
-      v: 1,
-    };
-    chat[aiFloor].extra = { ...(chat[aiFloor].extra ?? {}), bbs_leaf: leaf };
-
-    // 把本楼物品净变动写进正文 </bbs_end> 之后(<bbs_items> 旁注,正则隐藏显示、不进副API摘要):
-    // 窗口内全文楼层会被主模型看到,提示「这笔账已结算」;滚出窗口自然消失,符合取舍。
-    // 用 stateBefore.items(本楼之前的物品)作基准算 from→to;无变动则只清旧块。
-    const changes = itemChangesOf(storedDelta, stateBefore.items, timeEnd || timeStart || '');
-    chat[aiFloor].mes = writeItemLogTag(chat[aiFloor].mes, fmtItemLogInline(changes));
-
-    engineState.lastRunAt = Date.now();
-
-    // 立刻反映到派生与注入;落盘走防抖(隐藏由收尾的 syncWindowHiddenState 统一负责)
-    recomputeDerived();
-    refreshInjection();
-    scheduleLeafFlush();
-    scheduleVectorIndex(); // 新叶子 → 防抖同步进向量库(失败静默,不影响摘要)
-
+    await summarizeFloorWork(chat, aiFloor, sender);
     // 摘要积累到阈值则触发总结
     await checkResummary();
   } catch (e) {
@@ -688,6 +719,223 @@ async function runSummaryInner(aiFloor: number): Promise<void> {
     busy = false;
     engineState.running = false;
   }
+}
+
+/* ============ 批量补摘(分块批量,一次请求 → 多片单楼叶子) ============ */
+
+/** 批量进度/控制选项 */
+export interface BatchBackfillOpts {
+  /** 待补摘的 AI 楼层(由旧到新);省略则取当前所有待摘 AI 楼 */
+  floors?: number[];
+  /** 进度回调:done=已落叶楼数,total=总楼数 */
+  onProgress?: (done: number, total: number) => void;
+  /** 取消查询:返回 true 则在下个块边界停止(不打断进行中的块,保证已开块落叶完整) */
+  shouldCancel?: () => boolean;
+}
+
+/** 批量结果汇总 */
+export interface BatchBackfillResult {
+  /** 成功落叶的楼数 */
+  done: number;
+  /** 计划处理的总楼数 */
+  total: number;
+  /** 是否因取消提前结束 */
+  cancelled: boolean;
+}
+
+/**
+ * 按内容量把待摘楼层切成多个块:每块正文累计字符到 maxChars 或楼数到 maxFloors 即切。
+ * 单楼正文超 maxChars 时自成一块(不可再分)。每块楼层升序,块间升序。
+ * 字符量口径用 renderMessages(与喂模型同一清洗),只算该 AI 楼自身正文(够近似,省去重复算前置 user 楼)。
+ */
+export function planBatches(chat: STMessage[], floors: number[], maxChars: number, maxFloors: number): number[][] {
+  const ctx = getContext();
+  const name1 = ctx?.name1 ?? '';
+  const name2 = ctx?.name2 ?? '';
+  const lo = Math.max(1, maxFloors | 0);
+  const cap = Math.max(500, maxChars | 0);
+
+  const batches: number[][] = [];
+  let cur: number[] = [];
+  let curChars = 0;
+  for (const f of floors) {
+    const len = renderMessages(chat, [f], name1, name2).length;
+    // 当前块非空,且(加这楼会超字数 或 楼数已达上限)→ 先切块
+    if (cur.length && (curChars + len > cap || cur.length >= lo)) {
+      batches.push(cur);
+      cur = [];
+      curChars = 0;
+    }
+    cur.push(f);
+    curChars += len;
+  }
+  if (cur.length) batches.push(cur);
+  return batches;
+}
+
+/**
+ * 对一个块发一次批量请求,解析出 floors 数组并**逐楼落叶**(块内顺序,后楼承接前楼状态)。
+ * 校验 floors 长度 == 块楼数;不符则抛错(由调用方按重试/回退处理)。
+ */
+async function summarizeBatchWork(
+  chat: STMessage[],
+  block: number[],
+  sender: { send: (messages: ChatMsg[]) => Promise<string>; label: string },
+): Promise<void> {
+  const ctx = getContext();
+  if (!ctx) throw new Error('无 ST 上下文');
+  const covered = coveredSet(chat);
+
+  // 块开头之前的状态/历史/世界书(整块统一口径,只取一次)
+  const beforeIndex = floorTargets(chat, block[0], covered)[0];
+  const stateBefore = deriveMemory(chat, beforeIndex);
+  const history = renderHistoryNodes(selectHistoryNodesBefore(memory.summaries, chat, beforeIndex));
+
+  // 多楼正文:每楼带「━━ 第 n 楼 ━━」分隔,内含该 AI 楼 + 其前置未覆盖 user 楼
+  const allTargets: number[] = [];
+  const segments: string[] = [];
+  block.forEach((f, idx) => {
+    const targets = floorTargets(chat, f, covered);
+    allTargets.push(...targets);
+    segments.push(`━━ 第 ${idx + 1} 楼 ━━\n${renderMessages(chat, targets, ctx.name1, ctx.name2)}`);
+  });
+  const content = segments.join('\n\n');
+
+  // 世界书按整块合并正文激活一次(省去逐楼激活)
+  const worldInfo = await fetchWorldInfo(chat, allTargets, ctx.name1, ctx.name2);
+  const charCard = fetchCharCard();
+
+  const prompt = buildBatchSummaryPrompt({
+    user: ctx.name1,
+    char: ctx.name2,
+    time: stateBefore.state.time,
+    location: stateBefore.state.location,
+    history,
+    content,
+    floorCount: block.length,
+  });
+
+  const { checklist, prefill } = buildBatchThinking(block.length);
+  const messages: ChatMsg[] = [];
+  const jb = apiSettings.prompts.jailbreak.trim() || JAILBREAK_PROMPT;
+  if (jb) messages.push({ role: 'system', content: jb });
+  if (charCard) messages.push({ role: 'system', content: buildCharCardSystem(charCard) });
+  if (worldInfo) messages.push({ role: 'system', content: buildWorldInfoSystem(worldInfo) });
+  messages.push(
+    { role: 'user', content: prompt },
+    { role: 'system', content: checklist },
+    { role: 'assistant', content: prefill },
+  );
+
+  // 解析 { floors: [...] };校验长度等于块楼数(缺楼/多楼都算失败,触发重试/回退)
+  const list = await sendAndParse(sender.send, messages, raw => {
+    console.log('[柏宝书] 批量摘要原始返回(未清洗):\n', raw);
+    const d = extractJsonObject<{ floors?: SummaryDelta[] }>(raw);
+    const floors = d?.floors;
+    if (!Array.isArray(floors) || !floors.length) {
+      throw new Error(raw.trim() ? '批量摘要失败:AI道歉或掉格式' : '批量摘要失败:AI空回');
+    }
+    if (floors.length !== block.length) {
+      throw new Error(`批量摘要失败:返回 ${floors.length} 楼,期望 ${block.length} 楼`);
+    }
+    if (floors.some(f => !f || !f.summary)) {
+      throw new Error('批量摘要失败:有楼层缺 summary');
+    }
+    return floors;
+  });
+
+  // 逐楼落叶(块内顺序,严格按 block 升序)。批量只取 summary + 起止时间:
+  // 显式剥掉 items/plans/location —— 这些跨多楼难保顺序正确(易致计划/时间错乱),
+  // 即便 AI 不听话硬产了也丢弃。结构化数据交给后续正常的逐楼自动摘要。
+  block.forEach((f, idx) => {
+    const r = list[idx];
+    const lean: SummaryDelta = {
+      summary: r.summary,
+      timeStart: r.timeStart,
+      timeEnd: r.timeEnd,
+    };
+    const sb = deriveMemory(chat, f);
+    applyLeafForFloor(chat, f, lean, sb);
+  });
+
+  engineState.lastRunAt = Date.now();
+  recomputeDerived();
+  refreshInjection();
+  scheduleLeafFlush();
+  scheduleVectorIndex();
+}
+
+/**
+ * 批量补摘:把待摘 AI 楼按内容量切块,逐块串行发请求、**严格按楼序逐楼落叶**。
+ * 省 token 关键:固定上下文(破限/设定/前情)按块分摊,而非每楼重发。
+ *  - 批量只产 summary + 起止时间(不产物品/计划),避免跨多楼的结构化数据顺序错乱;
+ *    结构化数据交给后续正常的逐楼自动摘要补。
+ *  - 块间串行 + 块内 AI 顺序维护时间单调,后块用前块落盘后的前情。
+ *  - 某块解析失败(已含 summaryMaxRetries 次重试)→ 回退:对该块逐楼走单楼摘要(单楼路径仍产完整结构化数据),不中断整体。
+ *  - 取消在块边界生效(不打断进行中的块)。
+ * 全部完成后触发 checkResummary(连锁 L1/L2)+ 收尾(隐藏 + 注入)。
+ */
+export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<BatchBackfillResult> {
+  if (!engineActiveHere()) return { done: 0, total: 0, cancelled: false };
+  if (busy) return { done: 0, total: 0, cancelled: false };
+  const sender = resolveSender('summary');
+  if ('error' in sender) {
+    engineState.lastError = sender.error;
+    return { done: 0, total: 0, cancelled: false };
+  }
+  const ctx = getContext();
+  if (!ctx) return { done: 0, total: 0, cancelled: false };
+  const chat = ctx.chat ?? [];
+
+  // 目标楼层:显式传入则过滤成「当前确实待摘的 AI 楼」(防陈旧),否则取全部待摘
+  const pending = new Set(pendingAiFloors(chat));
+  const floors = (opts.floors ?? [...pending]).filter(f => pending.has(f)).sort((a, b) => a - b);
+  const total = floors.length;
+  if (total === 0) {
+    await afterSummaryHideAndInject(chat);
+    return { done: 0, total: 0, cancelled: false };
+  }
+
+  const batches = planBatches(chat, floors, apiSettings.batchMaxChars, apiSettings.batchMaxFloors);
+  console.log('[柏宝书] 批量补摘:', total, '楼 →', batches.length, '批,', sender.label);
+
+  busy = true;
+  engineState.running = true;
+  engineState.lastError = '';
+  let done = 0;
+  let cancelled = false;
+  try {
+    opts.onProgress?.(0, total);
+    for (const block of batches) {
+      if (opts.shouldCancel?.()) { cancelled = true; break; }
+      try {
+        await summarizeBatchWork(chat, block, sender);
+      } catch (e) {
+        // 整块失败(已含重试)→ 回退:逐楼单独摘。单楼也可能失败(写 lastError),失败楼留作待摘,不中断后续。
+        console.log('[柏宝书] 批量块失败,回退逐楼:', e instanceof Error ? e.message : String(e));
+        for (const f of block) {
+          if (!isAiFloor(chat[f]) || leafValid(chat[f])) continue; // 已被填或非 AI 楼:跳过
+          try {
+            await summarizeFloorWork(chat, f, sender);
+          } catch (e2) {
+            engineState.lastError = e2 instanceof Error ? e2.message : String(e2);
+          }
+        }
+      }
+      // 本块产出的已落叶楼计入进度(只数确实落上叶子的,失败楼不计)
+      done = floors.filter(f => leafValid(chat[f])).length;
+      opts.onProgress?.(done, total);
+    }
+    // 连锁触发总结(可能跨多层),失败写 lastError 不影响已落叶子
+    await checkResummary();
+  } catch (e) {
+    engineState.lastError = e instanceof Error ? e.message : String(e);
+  } finally {
+    busy = false;
+    engineState.running = false;
+  }
+  await afterSummaryHideAndInject(chat);
+  return { done, total, cancelled };
 }
 
 /**

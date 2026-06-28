@@ -68,6 +68,42 @@ function extractMonthIdentifier(dateStr: string): string | null {
   return null;
 }
 
+/** 中文数字字面 → 值(0-9);「两」按 2,「〇/零」按 0 */
+const CN_DIGIT: Record<string, number> = {
+  〇: 0, 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+};
+
+/** 中文数字字符集(供正则拼接;含「廿」=20、「卅」=30) */
+const CN_NUM_CLASS = '[一二三四五六七八九十两零〇廿卅]';
+
+/**
+ * 解析 1-99 的中文数字(十、十一、二十、二十一、廿一、卅 等);纯阿拉伯数字直接 parseInt。
+ * 仅覆盖日期/月份/小年份所需范围,失败返回 null。
+ */
+function cnNumToInt(raw: string): number | null {
+  if (!raw) return null;
+  const s = raw.trim();
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  // 农历「初」前缀:初一~初九=个位、初十=10。剥掉「初」后剩「七」「十」交给下面正常解析。
+  const str = s
+    .replace(/^初/, '')
+    .replace(/廿/g, '二十')
+    .replace(/卅/g, '三十'); // 廿/卅 展开成「二十/三十」
+  if (!str) return null; // 仅「初」无数字
+  // 含「十」:先处理,覆盖「十」(=10)、「十五」、「二十」、「二十一」等;单字「十」也走这里
+  const shiIdx = str.indexOf('十');
+  if (shiIdx >= 0) {
+    // 「十X」=1X(十在首位 → 十位为 1);「X十」「X十Y」→ 十位取前一字
+    const tens = shiIdx === 0 ? 1 : CN_DIGIT[str[shiIdx - 1]];
+    const onesPart = str.slice(shiIdx + 1);
+    const ones = onesPart ? CN_DIGIT[onesPart] : 0;
+    if (tens === undefined || ones === undefined) return null;
+    return tens * 10 + ones;
+  }
+  if (str.length === 1) return CN_DIGIT[str] ?? null; // 纯个位(含〇/两)
+  return null; // 无「十」又非单字 → 不在支持范围
+}
+
 /** 解析故事内日期字符串;解析不出返回 null */
 export function parseStoryDate(dateStr: string): StoryDate | null {
   if (!dateStr) return null;
@@ -98,25 +134,32 @@ export function parseStoryDate(dateStr: string): StoryDate | null {
     if (month >= 1 && month <= 12 && day >= 1 && day <= 31) return { month, day, type: 'standard' };
   }
 
-  // 标准:X年M月D日(带可选历法前缀,如「庆历四年九月廿九」无法走这条,只接受数字)
-  const yearCn = s.match(/(\d+)年\s*(\d{1,2})月(\d{1,2})日?/);
+  // 数字字段:阿拉伯数字或中文数字(含十/廿/卅),由 cnNumToInt 统一解析。
+  const NUM = `(?:\\d+|${CN_NUM_CLASS}+)`;
+  // 日字段额外允许农历「初」前缀(初七、初十);cnNumToInt 会剥掉「初」再解析。
+  const DAY = `(?:初)?${NUM}`;
+
+  // 标准:X年M月D日(年/月/日均可中文,带可选历法前缀,如「元持十二年八月二十一日」「永和十五年八月初七」)
+  const yearCn = s.match(new RegExp(`(${NUM})年\\s*(${NUM})月\\s*(${DAY})日?`));
   if (yearCn) {
-    const year = parseInt(yearCn[1], 10);
-    const month = parseInt(yearCn[2], 10);
-    const day = parseInt(yearCn[3], 10);
-    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+    const year = cnNumToInt(yearCn[1]);
+    const month = cnNumToInt(yearCn[2]);
+    const day = cnNumToInt(yearCn[3]);
+    if (year != null && month != null && day != null && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
       const prefixEnd = s.indexOf(yearCn[0]);
       const calendarPrefix = s.substring(0, prefixEnd).trim() || undefined;
       return { year, month, day, type: 'standard', calendarPrefix };
     }
   }
 
-  // 标准:M月D日
-  const cn = s.match(/(\d{1,2})月(\d{1,2})日?/);
+  // 标准:M月D日(月/日可中文,日可带「初」)
+  const cn = s.match(new RegExp(`(${NUM})月\\s*(${DAY})日?`));
   if (cn) {
-    const month = parseInt(cn[1], 10);
-    const day = parseInt(cn[2], 10);
-    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) return { month, day, type: 'standard' };
+    const month = cnNumToInt(cn[1]);
+    const day = cnNumToInt(cn[2]);
+    if (month != null && day != null && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return { month, day, type: 'standard' };
+    }
   }
 
   // 架空日历
@@ -229,7 +272,12 @@ export function relativeTimeLabel(eventTime?: string, nowTime?: string): string 
   if (days === -2) return '后天';
   if (days === -3) return '大后天';
 
-  const pair = toDatePair(ev, now);
+  // 「上周X/上个月X号/去年X月X日」等是公历口语,套到带历法前缀的古风/赛博时间(元持/庆历/星历…)上
+  // 既出戏、对小年份的 getDay() 还是乱算的。故带前缀时不取 pair → 跳过这些档,降级为通用「N天前/N个月前/N年前」。
+  // 纯数字日期(含 2099/12/31 这类赛博时间)无前缀,按公历照常显示口语档。
+  const fromHasPrefix = !!parseStoryDate(ev)?.calendarPrefix;
+  const toHasPrefix = !!parseStoryDate(now)?.calendarPrefix;
+  const pair = fromHasPrefix || toHasPrefix ? null : toDatePair(ev, now);
 
   if (days > 0) {
     // 过去方向
