@@ -38,23 +38,9 @@ export function makeLeafId(): string {
   return `leaf_${nowMs().toString(36)}_${rand}`;
 }
 
-/* ============ 文本清洗 + 陈旧识别 ============ */
+/* ============ 陈旧识别 ============ */
 
-/**
- * 清洗楼层正文,供分析模型阅读:
- *  去思维链 <think>/<thinking>、去物品变动块 <bbs_items>(插件写进正文的旁注,不该进摘要)、去标签、规范空白。
- * bbs_items 整段删(标签+内容):它是我们事后追加到 </bbs_end> 之后的物品变动旁注,
- * 喂副 API 时不应混进正文(否则副 API 会把已结算的变动当本轮新发生)。
- */
-export function stripHtml(s: string): string {
-  return String(s ?? '')
-    .replace(/<think(?:ing)?\b[\s\S]*?<\/think(?:ing)?>/gi, '') // 思维链
-    .replace(/<bbs_items\b[^>]*>[\s\S]*?<\/bbs_items>/gi, '') // 物品变动旁注(整段删)
-    .replace(/<[^>]+>/g, '') // 其余标签
-    .replace(/[ \t]+\n/g, '\n') // 行尾空白
-    .replace(/\n{3,}/g, '\n\n') // 折叠多余空行
-    .trim();
-}
+// 正文清洗已统一到 timeTag.ts 的 cleanBody / clampToTimeTags(整块删噪声标签,不再「裸删标签留内容」)。
 
 /** 取消息上的叶子(不校验有效性) */
 export function getLeaf(m: STMessage | undefined): LeafExtra | undefined {

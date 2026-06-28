@@ -24,7 +24,7 @@ import { rewriteQuery } from './rewrite';
 import { ensureRecallIndex } from './index';
 import { currentChatId, currentChatScope, currentVectorDb, recallScopes } from './scope';
 import { resolveKeepStart } from '../engine';
-import { compactTimeLabel, latestStoryTime, splitTimeLabel } from '../timeTag';
+import { cleanBody, compactTimeLabel, latestStoryTime, splitTimeLabel } from '../timeTag';
 import { relativeTimeLabel } from '../timeRel';
 import {
   previewOf,
@@ -328,7 +328,9 @@ async function rerankCandidates(query: string, hits: VecHit[], signal?: AbortSig
     // 无原文(如种子叶子)退摘要 document,此时补 【故事时间】头给时间上下文。
     // (超长由 rerankDocuments 内部按 token 截断/分批)
     const docs = hits.map(h => {
-      const full = (h.mesFull || '').trim();
+      // mesFull 现存原文,发给 rerank 前过 cleanBody(剔除状态栏/思维链/自定义标签等,
+      // 保留内嵌起止时间);老索引存的是已清洗文本,再洗幂等无副作用。
+      const full = h.mesFull ? cleanBody(h.mesFull).trim() : '';
       if (full) return full;
       const body = (h.document || '').trim();
       const t = (h.storyTime || '').trim();
@@ -371,9 +373,10 @@ function buildRecallText(
 
     const isFull = h.rerankScore >= cfg.rerankThreshold && fullUsed < cfg.fullTextCount;
     if (isFull) {
-      // 全文档优先发 mesFull(已含内嵌的起止时间),无则退 document
-      const useMesFull = !!(h.mesFull || '').trim();
-      const body = (h.mesFull || h.document || '').trim();
+      // 全文档优先发 mesFull(原文,过 cleanBody 清洗后已含内嵌起止时间),无则退 document
+      const cleanFull = h.mesFull ? cleanBody(h.mesFull).trim() : '';
+      const useMesFull = !!cleanFull;
+      const body = cleanFull || (h.document || '').trim();
       if (!body) continue;
       seen.add(h.leafId);
       tiers.set(h.leafId, 'full');

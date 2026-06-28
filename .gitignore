@@ -4,3 +4,4 @@ node_modules/
 .preview/
 .preview/shot-*.png
 .claude
+CLAUDE.md

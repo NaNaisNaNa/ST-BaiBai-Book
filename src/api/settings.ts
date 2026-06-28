@@ -136,6 +136,12 @@ export interface ApiSettings {
   batchMaxChars: number;
   /** 批量补摘:每批最大楼数兜底。即便字符没到上限,楼数到此也切块。 */
   batchMaxFloors: number;
+  /**
+   * 用户自定义「整块删除」标签名(只填标签名,不带尖括号,如 snow)。清洗正文时
+   * `<snow>…</snow>` 连同内部内容一并删掉。用于剔除其它插件/世界书写进正文的状态栏、
+   * 旁注等格式。改动对**召回时**即时生效(向量库存的是原文,召回再清洗),无需重建索引。
+   */
+  customStripTags: string[];
 }
 
 // extension_settings 里的命名空间键;localStorage 是旧版残留,仅用于一次性迁移。
@@ -188,6 +194,7 @@ function defaults(): ApiSettings {
     summaryMaxRetries: 1,
     batchMaxChars: 30000,
     batchMaxFloors: 10,
+    customStripTags: [],
   };
 }
 
@@ -239,7 +246,29 @@ function normalize(raw: unknown): ApiSettings {
     Number.isFinite(merged.batchMaxFloors) && merged.batchMaxFloors >= 1
       ? Math.floor(merged.batchMaxFloors)
       : 10;
+  // 自定义清洗标签:容错用户连尖括号/斜杠一起填进来(<snow> / </snow>),只留合法标签名字符;
+  // 去空、去重,缺失/非数组回退空数组。
+  merged.customStripTags = Array.isArray(merged.customStripTags)
+    ? Array.from(
+        new Set(
+          merged.customStripTags
+            .filter((x): x is string => typeof x === 'string')
+            .map(sanitizeTagName)
+            .filter(Boolean),
+        ),
+      )
+    : [];
   return merged;
+}
+
+/** 把用户输入规整成合法标签名:剥掉尖括号/斜杠/空白,只保留标签名允许的字符。 */
+export function sanitizeTagName(raw: string): string {
+  return String(raw ?? '')
+    .trim()
+    .replace(/^<\/?/, '') // 开头的 < 或 </
+    .replace(/>$/, '') // 结尾的 >
+    .trim()
+    .replace(/[^A-Za-z0-9_:-]/g, ''); // 标签名合法字符:字母数字 _ : -
 }
 
 /** 补全单个向量端点的字段并校验类型(缺失/类型不符回退空串)。 */
@@ -299,6 +328,7 @@ function applyInto(target: ApiSettings, src: ApiSettings): void {
   target.summaryMaxRetries = src.summaryMaxRetries;
   target.batchMaxChars = src.batchMaxChars;
   target.batchMaxFloors = src.batchMaxFloors;
+  target.customStripTags = src.customStripTags;
 }
 
 /** 写回 extension_settings 并防抖落盘到服务器(跨设备同步的关键)。 */

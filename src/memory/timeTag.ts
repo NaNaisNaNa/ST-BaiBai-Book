@@ -92,16 +92,60 @@ function leafSwipeMatches(leaf: LeafExtra, m: STMessage): boolean {
 }
 
 /**
- * 裁剪到时间标签区间:移除 <bbs_start> 之前、</bbs_end> 之后的所有文本(标签本身保留)。
- * 用于喂摘要模型前,剔除角色卡的状态栏、页眉页脚等正文之外的格式,避免干扰摘要生成。
- *
- * 取「最后一个 <bbs_start>」+「第一个 </bbs_end>」——思维链/状态栏里可能混入同名标签,
- * 思维链通常在正文前(故真正的开始标签是最后一个),正文的结束标签则是第一个出现的,
- * 这样能跳过这些干扰标签、精准框出真正的正文段。
- * 仅在对应标签存在时才裁剪;缺标签的一侧保持原样(两侧都没有则完全不动)。
+ * 按标签名生成「整块删除」正则(含标签本身与内部内容)。tag 已由 sanitizeTagName 规整为
+ * 合法标签名字符(字母数字 _ : -),正则安全。同时删配对块与落单的自闭/单标签。
  */
+function blockStripRegexes(tag: string): RegExp[] {
+  return [
+    new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?</${tag}>`, 'gi'), // 配对块
+    new RegExp(`<\\/?${tag}\\b[^>]*\\/?>`, 'gi'), // 落单的开/闭/自闭标签
+  ];
+}
+
+/** 删掉用户在设置里配置的自定义标签(整块:标签 + 内部内容)。空名单则原样返回。 */
+function stripCustomTags(s: string): string {
+  let out = s;
+  for (const tag of apiSettings.customStripTags) {
+    if (!tag) continue;
+    for (const re of blockStripRegexes(tag)) out = out.replace(re, '');
+  }
+  return out;
+}
+
+/**
+ * 把一段正文清洗成「干净正文段」:剔除正文之外的格式与噪声,但**不做「裸删标签留内容」**——
+ * 只整块删除明确的非正文标签(思维链/注释/旧 horae/物品旁注/用户自定义标签),其余原样保留。
+ *
+ * 两步:
+ *  ① 整块删除噪声标签(含内部内容);
+ *  ② 裁剪到时间标签区间:取「最后一个 <bbs_start>」+「第一个 </bbs_end>」之间(标签保留)——
+ *     思维链/状态栏可能混入同名标签,开始标签取末次、结束标签取首次,精准框出真正的正文段;
+ *     仅在对应标签存在时才裁剪,缺标签的一侧保持原样(两侧都没有则不裁,覆盖「旧聊天无标签」场景)。
+ *  ③ 规范空白。
+ *
+ * 注:历史上这里之后还跟一道 stripHtml 做「删所有标签留内容」,反而把自定义标签删没、令整块清洗失效;
+ * 现已废弃 stripHtml,改为只整块删、保留其余标签原文(主/副模型都能消化残留标签)。
+ */
+// 思维链块正则(配对块,含内部内容)。供 clampToTimeTags 与入库前预清洗共用,避免两处漂移。
+const RE_THINK_BLOCK = /<think(?:ing)?\b[\s\S]*?<\/think(?:ing)?>/gi;
+
+/**
+ * 只剥思维链 <think>/<thinking> 块(含内部内容)。
+ * 用于向量库**入库前**预清洗:思维链是确定性噪声(不依赖任何用户配置),
+ * 入库时删掉既省空间又零风险;而自定义标签等「可变配置」的清洗仍留到召回时做(才能让改设置即时生效)。
+ */
+export function stripThinkBlocks(mes: string): string {
+  return String(mes ?? '').replace(RE_THINK_BLOCK, '');
+}
+
 export function clampToTimeTags(mes: string): string {
-  let s = String(mes ?? '');
+  let s = String(mes ?? '')
+    .replace(RE_THINK_BLOCK, '') // 思维链
+    .replace(/<!--[\s\S]+?-->/g, '') // HTML 注释
+    .replace(/<horae[\s\S]*?>[\s\S]*?<\/horae[\s\S]*?>/gi, '') // 旧 horae 格式
+    .replace(RE_ITEMS_BLOCK, ''); // 物品变动旁注(插件写进正文,不该进摘要/索引)
+  s = stripCustomTags(s); // 用户自定义标签
+
   // 最后一个 <bbs_start> 的位置:全局扫一遍取末次
   const startRe = new RegExp(`<${START_TAG}\\b`, 'gi');
   let lastStart = -1;
@@ -112,13 +156,25 @@ export function clampToTimeTags(mes: string): string {
   if (endMatch && endMatch.index !== undefined) {
     s = s.slice(0, endMatch.index + endMatch[0].length);
   }
-  return s;
+  // 规范空白(原由 stripHtml 负责,现内置)
+  return s
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 /**
- * 把正文里的时间标签转成可读内联文本(供喂给摘要模型前预处理)。
- * stripHtml 会把 <bbs_start>…</bbs_start> 整段删掉(含内部时间),摘要模型就看不到时间了;
- * 故先转成「(起始时间:X)/(结束时间:X)」纯文本,再交给 stripHtml 清其余标签。
+ * 统一正文清洗入口(替代旧的 stripHtml 链路):裁剪正文段 → 把时间标签转可读文本。
+ * 摘要生成、世界书扫描、向量召回注入全部走它,保证口径一致;不再「裸删标签」,残留标签原样保留。
+ */
+export function cleanBody(mes: string): string {
+  return inlineTimeTags(clampToTimeTags(mes));
+}
+
+/**
+ * 把正文里的时间标签转成可读内联文本(cleanBody 的最后一步)。
+ * 时间标签 <bbs_start>…</bbs_start> 不在「整块删除」之列,但其尖括号形态对模型不友好,
+ * 故转成「(起始时间:X)/(结束时间:X)」纯文本,保留时间信息又去掉标签外形。
  */
 export function inlineTimeTags(mes: string): string {
   return String(mes ?? '')

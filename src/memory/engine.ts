@@ -5,11 +5,11 @@ import type { TaskType } from '@/api/settings';
 import type { STMessage } from '@/st/context';
 import { getContext } from '@/st/context';
 import { toast } from '@/st/toast';
-import { addSummary, deriveMemory, finalizeDelta, getLeaf, itemChangesOf, leafValid, makeLeafId, pruneBrokenComps, stripHtml, syncItemLogFromMessage } from './apply';
+import { addSummary, deriveMemory, finalizeDelta, getLeaf, itemChangesOf, leafValid, makeLeafId, pruneBrokenComps, syncItemLogFromMessage } from './apply';
 import { extractJsonObject } from './json';
 import { clearInjection, refreshInjection, renderHistoryNodes, selectHistoryNodesBefore } from './inject';
 import { buildBatchSummaryPrompt, buildBatchThinking, buildCharCardSystem, buildResummaryPrompt, buildSummaryPrompt, buildWorldInfoSystem, fmtItemLogInline, JAILBREAK_PROMPT, THINKING_CHECKLIST, THINKING_PREFILL } from './prompts';
-import { clampToTimeTags, inlineTimeTags, parseTimeRange, syncTimeTagRegex, writeItemLogTag } from './timeTag';
+import { clampToTimeTags, cleanBody, parseTimeRange, syncTimeTagRegex, writeItemLogTag } from './timeTag';
 import { memory, recomputeDerived, scheduleLeafFlush } from './store';
 import type { LeafExtra, SummaryDelta } from './types';
 import { scheduleVectorIndex } from './vector';
@@ -48,7 +48,7 @@ export function currentSummaryPromise(): Promise<void> | null {
   return currentRun;
 }
 
-/** 把消息渲染成给摘要模型的文本(stripHtml 复用 apply 的清洗,与 leafHash 一致) */
+/** 把消息渲染成给摘要模型的文本(cleanBody:裁正文段 + 整块删噪声标签 + 时间标签转文本) */
 function renderMessages(chat: STMessage[], indices: number[], name1: string, name2: string): string {
   return indices
     .map(i => {
@@ -57,9 +57,9 @@ function renderMessages(chat: STMessage[], indices: number[], name1: string, nam
       // 双标:既标发言方(用户/角色),又带人名 —— 摘要正文用人名,群聊也能区分谁说的
       const tag = m.is_user ? '用户' : '角色';
       const who = m.is_user ? name1 || 'User' : m.name || name2 || 'Char';
-      // 处理顺序:先裁剪到 <bbs_start>…</bbs_end>(剔除状态栏等正文外格式)→
-      // 再把时间标签转可读文本(否则 stripHtml 会连内部时间一起删)→ 最后清洗思维链/标签
-      return `【${tag}·${who}】${stripHtml(inlineTimeTags(clampToTimeTags(m.mes)))}`;
+      // cleanBody:裁剪到 <bbs_start>…</bbs_end>(剔除状态栏等正文外格式)+ 整块删噪声标签
+      //（思维链/注释/物品旁注/自定义标签)+ 时间标签转可读文本。不再裸删标签。
+      return `【${tag}·${who}】${cleanBody(m.mes)}`;
     })
     .filter(Boolean)
     .join('\n\n');
@@ -83,7 +83,7 @@ async function fetchWorldInfo(chat: STMessage[], targets: number[], name1: strin
         const m = chat[i];
         if (!m) return '';
         const who = m.is_user ? name1 || 'User' : m.name || name2 || 'Char';
-        return `${who}: ${stripHtml(m.mes)}`;
+        return `${who}: ${clampToTimeTags(m.mes)}`;
       })
       .filter(Boolean);
     if (!scanText.length) return '';

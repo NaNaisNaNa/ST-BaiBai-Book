@@ -3,7 +3,7 @@ import Collapsible from '@/components/Collapsible.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import { fetchModels, testChannel } from '@/api/client';
-import { apiSettings, newChannel, resolveVectorModel, type ApiChannel } from '@/api/settings';
+import { apiSettings, newChannel, resolveVectorModel, sanitizeTagName, type ApiChannel } from '@/api/settings';
 import { getContext } from '@/st/context';
 import {
   JAILBREAK_PROMPT,
@@ -484,6 +484,22 @@ function toggleExcluded(name: string) {
   else list.push(name);
 }
 
+/* —— 自定义清洗标签:用户填标签名(如 snow),清洗正文时把 <snow>…</snow> 整块删掉 —— */
+const stripTagDraft = ref('');
+function addStripTag() {
+  const tag = sanitizeTagName(stripTagDraft.value);
+  if (!tag) {
+    stripTagDraft.value = '';
+    return;
+  }
+  if (!apiSettings.customStripTags.includes(tag)) apiSettings.customStripTags.push(tag);
+  stripTagDraft.value = '';
+}
+function removeStripTag(tag: string) {
+  const idx = apiSettings.customStripTags.indexOf(tag);
+  if (idx >= 0) apiSettings.customStripTags.splice(idx, 1);
+}
+
 // 点宏标签 → 插入到文本框光标处(无焦点则追加到末尾)
 function insertMacro(token: string) {
   const el = promptArea.value;
@@ -733,6 +749,36 @@ function scorePct(score: number): number {
           </li>
         </ul>
         <p v-else class="bbs-field-hint">名单为空,所有角色都启用记忆系统。</p>
+      </Collapsible>
+
+      <!-- 自定义清洗标签 -->
+      <Collapsible title="自定义清洗标签" :open="false">
+        <p class="bbs-field-hint">
+          正文里若混入其它插件/世界书写的格式块(如状态栏 <code>&lt;snow&gt;…&lt;/snow&gt;</code>),
+          可在此填入标签名(只填 <code>snow</code>,不带尖括号),摘要、向量索引与召回时会把整块连内容一并删掉。
+          调整后对**召回**即时生效(向量库存原文、召回再清洗),无需重建索引。
+        </p>
+        <div class="bbs-striptag-bar">
+          <input
+            v-model="stripTagDraft"
+            class="bbs-input"
+            type="text"
+            placeholder="标签名,如 snow"
+            @keydown.enter.prevent="addStripTag"
+          />
+          <button class="bbs-btn bbs-btn-primary bbs-btn-sm" type="button" @click="addStripTag">
+            <Icon name="plus" /> 添加
+          </button>
+        </div>
+        <ul v-if="apiSettings.customStripTags.length" class="bbs-exclude-chips">
+          <li v-for="tag in apiSettings.customStripTags" :key="tag" class="bbs-exclude-chip">
+            <span class="bbs-exclude-chip-name">&lt;{{ tag }}&gt;</span>
+            <button class="bbs-exclude-chip-x" type="button" title="移除" @click="removeStripTag(tag)">
+              <Icon name="close" />
+            </button>
+          </li>
+        </ul>
+        <p v-else class="bbs-field-hint">暂无自定义标签。仅内置清洗(思维链、注释、物品旁注等)生效。</p>
       </Collapsible>
 
       <!-- 自定义提示词 -->
@@ -2206,6 +2252,21 @@ function scorePct(score: number): number {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   tab-size: 2;
+}
+
+/* —— 自定义清洗标签:输入框 + 添加按钮一行 —— */
+.bbs-striptag-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+.bbs-striptag-bar .bbs-input {
+  flex: 1;
+  min-width: 0;
+}
+.bbs-striptag-bar .bbs-btn {
+  flex: none;
 }
 
 /* —— 排除角色:已排除名字以药丸形式平铺,点 × 移出 —— */

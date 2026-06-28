@@ -15,9 +15,9 @@ import { getContext, type STMessage } from '@/st/context';
 import { apiSettings, engineActiveHere } from '@/api/settings';
 import type { VecItem } from '@/api/baibaoku';
 import { resetVectorStoreProbe, vecClearScope, vecReconcile, vecUpsert } from './store';
-import { getLeaf, leafValid, stripHtml } from '../apply';
+import { getLeaf, leafValid } from '../apply';
 import { resolveKeepStart } from '../engine';
-import { clampToTimeTags, inlineTimeTags } from '../timeTag';
+import { stripThinkBlocks } from '../timeTag';
 import type { LeafExtra } from '../types';
 import { embedTexts, encodeFloat32Base64 } from './embed';
 import { currentChatId, currentVectorDb } from './scope';
@@ -30,15 +30,6 @@ function docHashOf(text: string): string {
     h = Math.imul(h, 0x01000193);
   }
   return (h >>> 0).toString(16).padStart(8, '0');
-}
-
-/**
- * 楼层原文清洗,供跨聊天召回「全文档」存档/回注。与喂摘要模型同口径(engine.ts):
- *  clampToTimeTags(框出正文段,去最后一个 <bbs_start> 前 / 第一个 </bbs_end> 后的状态栏/思维链/页脚)
- *  → inlineTimeTags(时间标签转可读文本,保留时间信息)→ stripHtml(清其余标签)。
- */
-function cleanMesFull(mes: string): string {
-  return stripHtml(inlineTimeTags(clampToTimeTags(mes)));
 }
 
 interface LeafForIndex {
@@ -74,7 +65,9 @@ function collectLeaves(chat: STMessage[]): LeafForIndex[] {
       leafId: leaf.id,
       docHash: docHashOf(document),
       document,
-      mesFull: cleanMesFull(chat[i].mes),
+      // 存近乎原文:只预剥思维链(确定性噪声,省空间且零风险),其余清洗(自定义标签等)
+      // 留到召回时过 cleanBody——这样用户日后调整「自定义清洗标签」设置,老索引也即时生效,无需重建。
+      mesFull: stripThinkBlocks(chat[i].mes),
       storyTime: leafStoryTime(leaf),
       msgIndex: i,
     });

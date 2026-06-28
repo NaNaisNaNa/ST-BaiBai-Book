@@ -16,12 +16,12 @@
 import type { STMessage } from '@/st/context';
 import { getContext } from '@/st/context';
 import { resolveVectorModel } from '@/api/settings';
-import { deriveMemory, getLeaf, leafValid, stripHtml } from '../apply';
+import { deriveMemory, getLeaf, leafValid } from '../apply';
 import { resolveKeepStart } from '../engine';
 import { renderHistoryNodes, selectHistoryNodesBefore } from '../inject';
 import { fmtItems, fmtPlans, QUERY_REWRITE_SYSTEM, QUERY_REWRITE_TAIL } from '../prompts';
 import { memory } from '../store';
-import { clampToTimeTags, inlineTimeTags } from '../timeTag';
+import { cleanBody } from '../timeTag';
 
 /** rewrite 模型最多取几条 query(对齐 Horae) */
 const MAX_QUERIES = 6;
@@ -40,13 +40,9 @@ interface ChatMsg {
   content: string;
 }
 
-/**
- * 把楼层正文清洗成可读文本,与喂摘要模型同口径(engine.ts):
- *  clampToTimeTags(框出正文段,去最后一个 <bbs_start> 前 / 第一个 </bbs_end> 后的状态栏/思维链/页脚)
- *  → inlineTimeTags(时间标签转可读文本,免被 stripHtml 删掉)→ stripHtml(清其余标签)。
- */
+/** 把楼层正文清洗成可读文本,与喂摘要模型同口径(cleanBody:裁正文段 + 整块删噪声标签 + 时间转文本)。 */
 function cleanFloor(m: STMessage): string {
-  return stripHtml(inlineTimeTags(clampToTimeTags(m.mes)));
+  return cleanBody(m.mes);
 }
 
 /**
