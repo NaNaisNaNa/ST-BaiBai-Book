@@ -177,7 +177,7 @@ function defaults(): ApiSettings {
     channels: [],
     assignments: { summary: '', resummary: '' },
     autoSummaryEnabled: true,
-    keepRecent: 5,
+    keepRecent: 3,
     excludedChars: [],
     leafBatchThreshold: 12,
     resummaryThreshold: 7,
