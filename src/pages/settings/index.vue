@@ -23,6 +23,8 @@ import { recallDebug } from '@/memory/vector/debug';
 import { computeCarryoverPlan, createNewChatWithCarryover, type CarryoverPlan } from '@/memory/carryover';
 import { computeMigrationPlan, runHoraeMigration, type MigrationPlan } from '@/memory/migrate';
 import { ui, THEMES, type NavPosition } from '@/state/ui';
+import { uploadOrbImage } from '@/st/upload';
+import { toast } from '@/st/toast';
 import { computed, nextTick, onMounted, ref } from 'vue';
 
 const navOptions: { value: NavPosition; label: string }[] = [
@@ -30,6 +32,31 @@ const navOptions: { value: NavPosition; label: string }[] = [
   { value: 'top', label: '顶部' },
   { value: 'bottom', label: '底部' },
 ];
+
+/* —— 悬浮球自定义图标:选图 → 压缩上传到 ST 服务器 → 存路径串(跨设备同步) —— */
+const orbFileInput = ref<HTMLInputElement | null>(null);
+const orbUploading = ref(false);
+function pickOrbImage() {
+  orbFileInput.value?.click();
+}
+async function onOrbFileChange(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = ''; // 复位,允许重复选同一文件
+  if (!file) return;
+  orbUploading.value = true;
+  try {
+    ui.orbImage = await uploadOrbImage(file);
+    toast('悬浮球图标已更新', 'success');
+  } catch (err) {
+    toast(err instanceof Error ? err.message : '上传失败', 'error');
+  } finally {
+    orbUploading.value = false;
+  }
+}
+function resetOrbImage() {
+  ui.orbImage = '';
+}
 
 /* —— 渠道:列表只读展示,编辑/新建都在弹窗里进行,避免一长列表平铺误触。
    两套独立渠道:'api'=副 API(摘要/总结),'vector'=向量记忆。弹窗按 scope 操作对应列表。 —— */
@@ -644,6 +671,34 @@ function scorePct(score: number): number {
           <input v-model="ui.showTopBar" type="checkbox" class="bbs-checkbox" />
         </label>
         <p class="bbs-field-hint">在酒馆顶部导航栏(用户设定管理左侧)加一个快速打开柏宝书的按钮,免去每次点左下角魔杖。左下角魔杖入口照旧保留。</p>
+
+        <label class="bbs-switch-row">
+          <span class="bbs-field-label">在聊天框上方显示按钮</span>
+          <input v-model="ui.showQuickReply" type="checkbox" class="bbs-checkbox" />
+        </label>
+        <p class="bbs-field-hint">在输入框上方(与快速回复同位)加一个「柏宝书」按钮,跟随酒馆主题美化。</p>
+
+        <label class="bbs-switch-row">
+          <span class="bbs-field-label">显示屏幕悬浮球</span>
+          <input v-model="ui.showOrb" type="checkbox" class="bbs-checkbox" />
+        </label>
+        <p class="bbs-field-hint">在屏幕边缘挂一枚可拖动的悬浮球,点击即开柏宝书。拖到中间可常驻悬浮,拖近左右边缘则吸附贴边。</p>
+
+        <!-- 悬浮球图标:仅开启时可配 -->
+        <div v-if="ui.showOrb" class="bbs-orb-config">
+          <div class="bbs-orb-preview" :class="{ 'has-image': !!ui.orbImage }">
+            <img v-if="ui.orbImage" :src="ui.orbImage" alt="悬浮球图标预览" />
+            <Icon v-else name="bookmark" />
+          </div>
+          <div class="bbs-orb-config-actions">
+            <button type="button" class="bbs-btn bbs-btn-sm bbs-btn-primary" :disabled="orbUploading" @click="pickOrbImage">
+              {{ orbUploading ? '上传中…' : ui.orbImage ? '更换图标' : '上传图标' }}
+            </button>
+            <button v-if="ui.orbImage" type="button" class="bbs-btn bbs-btn-sm" @click="resetOrbImage">恢复默认</button>
+          </div>
+          <input ref="orbFileInput" type="file" accept="image/*" hidden @change="onOrbFileChange" />
+        </div>
+        <p v-if="ui.showOrb" class="bbs-field-hint">自定义图标会压缩后上传到酒馆服务器(跨设备同步);留空则用默认书签图标。</p>
       </Collapsible>
 
       <!-- 副 API -->
@@ -1586,6 +1641,38 @@ function scorePct(score: number): number {
 .bbs-btn-sm {
   padding: 6px 11px;
   font-size: 12px;
+}
+
+/* 悬浮球图标配置:预览方块 + 操作按钮 */
+.bbs-orb-config {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 4px;
+}
+.bbs-orb-preview {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--bbs-line-strong);
+  border-radius: var(--bbs-radius-sm);
+  background: var(--bbs-surface);
+  color: var(--bbs-accent);
+  font-size: 22px;
+  overflow: hidden;
+}
+.bbs-orb-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.bbs-orb-config-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 /* 测试按钮文字:默认(PC)显完整版,短版藏起;窄屏在媒体查询里互换 */

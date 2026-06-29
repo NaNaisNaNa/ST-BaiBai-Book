@@ -1,32 +1,12 @@
 import { openBook } from '@/state/ui';
+import { ensureIconFallback } from '@/st/iconFallback';
 
 const BTN_ID = 'bbs-topbar-button';
 const STYLE_ID = 'bbs-topbar-style';
 
-/**
- * 兜底样式:有些酒馆美化主题会把顶栏所有 .drawer-icon.fa-solid::before 的字体图标
- * 清空(content:''、color:transparent、font-size:0),改用 background-image 按**每个按钮 id**
- * 单独贴自定义图标。我们的按钮不在它们的名单里,会变成一片空白。
- * 这里用更高特异性(两个 id)+ !important 压过那条通用规则,强制还原 fa-book-bookmark 的字形。
- * \e0bb = fa-book-bookmark 的 Unicode(取自 ST 的 fontawesome.min.css,别凭记忆猜)。
- */
-const FALLBACK_CSS = `
-#top-settings-holder #${BTN_ID} .drawer-icon.fa-solid::before {
-  content: '\\e0bb' !important;
-  width: auto !important;
-  height: auto !important;
-  font-size: inherit !important;
-  color: inherit !important;
-  background: none !important;
-}
-`;
-
 function ensureStyle(): void {
-  if (document.getElementById(STYLE_ID)) return;
-  const style = document.createElement('style');
-  style.id = STYLE_ID;
-  style.textContent = FALLBACK_CSS;
-  document.head.appendChild(style);
+  // 美化主题可能清空顶栏图标字形,用高特异性选择器强制还原(见 iconFallback)
+  ensureIconFallback(STYLE_ID, `#top-settings-holder #${BTN_ID} .drawer-icon.fa-solid`);
 }
 
 /**

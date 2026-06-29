@@ -8,6 +8,7 @@ import { checkForUpdate } from '@/memory/update';
 import App from '@/App.vue';
 import { injectMenuButton } from '@/menu';
 import { syncTopBarButton } from '@/topbar';
+import { syncQuickReplyButton } from '@/quickReply';
 import { ui } from '@/state/ui';
 import { watch } from 'vue';
 // 这两行让 Vite 把全局样式打进 dist/index.css(随后注入 shadow root)
@@ -107,6 +108,12 @@ $(() => {
   watch(
     () => ui.showTopBar,
     on => syncTopBarButton(on),
+  );
+  // 聊天框快速回复式按钮:同上范式
+  syncQuickReplyButton(ui.showQuickReply);
+  watch(
+    () => ui.showQuickReply,
+    on => syncQuickReplyButton(on),
   );
   // 记忆系统:等 ST 的 getContext 就绪后再绑定(加载顺序不确定时轮询)
   bindMemoryWhenReady();

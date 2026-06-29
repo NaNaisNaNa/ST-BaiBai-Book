@@ -103,6 +103,12 @@ export interface UiPrefs {
   navTapClose: boolean;
   /** 在 ST 顶栏注入一个快速打开按钮(魔杖菜单入口照旧保留)。默认关。 */
   showTopBar: boolean;
+  /** 在聊天框上方注入「快速回复」式按钮,点击打开柏宝书。默认关。 */
+  showQuickReply: boolean;
+  /** 屏幕边缘悬浮球,点击打开柏宝书。默认关。 */
+  showOrb: boolean;
+  /** 悬浮球自定义图标:ST 服务器图片路径(saveBase64AsFile 返回的短串);空=用默认书签图标。跨设备同步。 */
+  orbImage: string;
 }
 
 /** 字数详尽档位:detailed=详细(默认),concise=精简(摘要/总结/二次总结字数一并降低)。仅影响内置模板。 */
@@ -168,7 +174,15 @@ function migrateLegacyUiPrefs(target: ApiSettings): void {
 function defaults(): ApiSettings {
   return {
     enabled: true,
-    ui: { theme: 'day', navPosition: 'auto', navTapClose: true, showTopBar: false },
+    ui: {
+      theme: 'day',
+      navPosition: 'auto',
+      navTapClose: true,
+      showTopBar: false,
+      showQuickReply: false,
+      showOrb: false,
+      orbImage: '',
+    },
     prompts: { summary: '', resummary: '', resummary2: '', jailbreak: '', timeTag: '' },
     verbosity: 'detailed',
     vector: {
@@ -214,6 +228,9 @@ function normalize(raw: unknown): ApiSettings {
     navPosition: typeof ru.navPosition === 'string' ? ru.navPosition : d.ui.navPosition,
     navTapClose: typeof ru.navTapClose === 'boolean' ? ru.navTapClose : d.ui.navTapClose,
     showTopBar: typeof ru.showTopBar === 'boolean' ? ru.showTopBar : d.ui.showTopBar,
+    showQuickReply: typeof ru.showQuickReply === 'boolean' ? ru.showQuickReply : d.ui.showQuickReply,
+    showOrb: typeof ru.showOrb === 'boolean' ? ru.showOrb : d.ui.showOrb,
+    orbImage: typeof ru.orbImage === 'string' ? ru.orbImage : d.ui.orbImage,
   };
   // excludedChars 必须是字符串数组,旧值类型不符时回退空数组
   merged.excludedChars = Array.isArray(merged.excludedChars)

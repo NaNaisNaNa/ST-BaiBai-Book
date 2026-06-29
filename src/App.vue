@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import Icon from '@/components/Icon.vue';
 import NavBar from '@/components/NavBar.vue';
+import FloatingOrb from '@/components/FloatingOrb.vue';
 import { getPage } from '@/pages/registry';
 import { closeBook, cycleTheme, lastOpenedAt, THEMES, ui } from '@/state/ui';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
@@ -84,6 +85,8 @@ const windowStyle = computed(() => {
 
 <template>
   <div class="bbs-root" :data-theme="ui.theme">
+    <!-- 悬浮球:留在 shadow 内才能用 --bbs-* 主题变量;自身 position:fixed 贴边,不受 host 影响 -->
+    <FloatingOrb v-if="ui.showOrb" />
     <Transition name="bbs-fade">
       <div
         v-if="ui.open"
