@@ -221,7 +221,7 @@ export async function rewriteQuery(signal?: AbortSignal): Promise<RewriteResult>
         // 国产模型(Qwen3/GLM 等)默认开思维链会先吐 <think> 推理,冲乱 INTENT/Q 行格式导致解析失败。
         temperature: 0.1,
         top_p: 0.8,
-        max_tokens: 800,
+        max_tokens: 8192,
         stream: false,
         enable_thinking: false,
       }),
