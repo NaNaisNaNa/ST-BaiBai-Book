@@ -638,6 +638,12 @@ function scorePct(score: number): number {
           <input v-model="ui.navTapClose" type="checkbox" class="bbs-checkbox" />
         </label>
         <p class="bbs-field-hint">移动端再点一下当前所在页的导航按钮即可关闭整个窗口,省得去够右上角的 ×。怕误触可关。</p>
+
+        <label class="bbs-switch-row">
+          <span class="bbs-field-label">在 ST 顶栏显示按钮</span>
+          <input v-model="ui.showTopBar" type="checkbox" class="bbs-checkbox" />
+        </label>
+        <p class="bbs-field-hint">在酒馆顶部导航栏(用户设定管理左侧)加一个快速打开柏宝书的按钮,免去每次点左下角魔杖。左下角魔杖入口照旧保留。</p>
       </Collapsible>
 
       <!-- 副 API -->

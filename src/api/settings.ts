@@ -101,6 +101,8 @@ export interface UiPrefs {
   navPosition: string;
   /** 移动端:再点当前页导航按钮即关闭整窗。默认开;怕误触的用户可关。 */
   navTapClose: boolean;
+  /** 在 ST 顶栏注入一个快速打开按钮(魔杖菜单入口照旧保留)。默认关。 */
+  showTopBar: boolean;
 }
 
 /** 字数详尽档位:detailed=详细(默认),concise=精简(摘要/总结/二次总结字数一并降低)。仅影响内置模板。 */
@@ -166,7 +168,7 @@ function migrateLegacyUiPrefs(target: ApiSettings): void {
 function defaults(): ApiSettings {
   return {
     enabled: true,
-    ui: { theme: 'day', navPosition: 'auto', navTapClose: true },
+    ui: { theme: 'day', navPosition: 'auto', navTapClose: true, showTopBar: false },
     prompts: { summary: '', resummary: '', resummary2: '', jailbreak: '', timeTag: '' },
     verbosity: 'detailed',
     vector: {
@@ -211,6 +213,7 @@ function normalize(raw: unknown): ApiSettings {
     theme: typeof ru.theme === 'string' ? ru.theme : d.ui.theme,
     navPosition: typeof ru.navPosition === 'string' ? ru.navPosition : d.ui.navPosition,
     navTapClose: typeof ru.navTapClose === 'boolean' ? ru.navTapClose : d.ui.navTapClose,
+    showTopBar: typeof ru.showTopBar === 'boolean' ? ru.showTopBar : d.ui.showTopBar,
   };
   // excludedChars 必须是字符串数组,旧值类型不符时回退空数组
   merged.excludedChars = Array.isArray(merged.excludedChars)

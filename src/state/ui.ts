@@ -34,6 +34,8 @@ interface UiState {
   navPosition: NavPosition;
   /** 移动端:再点当前页导航按钮即关窗(默认开,怕误触可关) */
   navTapClose: boolean;
+  /** 在 ST 顶栏注入快速打开按钮(默认关) */
+  showTopBar: boolean;
 }
 
 // activePage(上次停在哪一页)是纯本机临时导航态,跨设备同步无意义、且翻页即回写服务器太频繁,
@@ -63,6 +65,7 @@ export const ui = reactive<UiState>({
   theme: validTheme(apiSettings.ui.theme),
   navPosition: validNav(apiSettings.ui.navPosition),
   navTapClose: apiSettings.ui.navTapClose,
+  showTopBar: apiSettings.ui.showTopBar,
 });
 
 // settings 跨设备同步值就绪后,把主题/导航回灌进 ui(覆盖 import 阶段的默认)
@@ -70,15 +73,17 @@ onSettingsReady(() => {
   ui.theme = validTheme(apiSettings.ui.theme);
   ui.navPosition = validNav(apiSettings.ui.navPosition);
   ui.navTapClose = apiSettings.ui.navTapClose;
+  ui.showTopBar = apiSettings.ui.showTopBar;
 });
 
 // ui 改变 → 写回 apiSettings.ui(由 settings 的 watch 防抖落盘、跨设备同步);activePage 仍存本机。
 watch(
-  () => [ui.theme, ui.navPosition, ui.navTapClose],
+  () => [ui.theme, ui.navPosition, ui.navTapClose, ui.showTopBar],
   () => {
     apiSettings.ui.theme = ui.theme;
     apiSettings.ui.navPosition = ui.navPosition;
     apiSettings.ui.navTapClose = ui.navTapClose;
+    apiSettings.ui.showTopBar = ui.showTopBar;
   },
 );
 watch(

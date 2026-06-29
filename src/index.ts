@@ -7,6 +7,9 @@ import { bindChatLifecycle } from '@/memory/store';
 import { checkForUpdate } from '@/memory/update';
 import App from '@/App.vue';
 import { injectMenuButton } from '@/menu';
+import { syncTopBarButton } from '@/topbar';
+import { ui } from '@/state/ui';
+import { watch } from 'vue';
 // 这两行让 Vite 把全局样式打进 dist/index.css(随后注入 shadow root)
 import '@/styles/base.css';
 import '@/styles/theme.css';
@@ -99,6 +102,12 @@ function mount() {
 $(() => {
   mount();
   injectMenuButton();
+  // 顶栏快速打开按钮:按开关注入/移除。watch 在开关变化(含 hydrate 回灌真值)时同步。
+  syncTopBarButton(ui.showTopBar);
+  watch(
+    () => ui.showTopBar,
+    on => syncTopBarButton(on),
+  );
   // 记忆系统:等 ST 的 getContext 就绪后再绑定(加载顺序不确定时轮询)
   bindMemoryWhenReady();
 });
