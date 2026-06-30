@@ -572,7 +572,7 @@ function saveEdit() {
     </div>
 
     <!-- ===== 添加计划 / 悬念弹窗 ===== -->
-    <ModalMask v-if="composerOpen" @close="closeComposer">
+    <ModalMask :open="composerOpen" @close="closeComposer">
       <div class="bbs-modal" role="dialog" aria-modal="true" aria-label="添加计划或悬念">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">添加计划 / 悬念</span>
@@ -614,8 +614,8 @@ function saveEdit() {
     </ModalMask>
 
     <!-- ===== 编辑计划 / 悬念弹窗 ===== -->
-    <ModalMask v-if="editingPlan" @close="cancelPlanEdit">
-      <div class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑计划或悬念">
+    <ModalMask :open="!!editingPlan" @close="cancelPlanEdit">
+      <div v-if="editingPlan" class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑计划或悬念">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">编辑{{ editingPlan.kind === 'suspense' ? '悬念' : '计划' }}</span>
           <button class="bbs-summary-act" type="button" title="关闭" @click="cancelPlanEdit"><Icon name="close" /></button>
@@ -640,8 +640,8 @@ function saveEdit() {
     </ModalMask>
 
     <!-- ===== 编辑弹窗 ===== -->
-    <ModalMask v-if="editing" @close="cancelEdit">
-      <div class="bbs-modal" role="dialog" aria-modal="true" :aria-label="editing.kind === 'comp' ? '编辑总结' : '编辑摘要'">
+    <ModalMask :open="!!editing" @close="cancelEdit">
+      <div v-if="editing" class="bbs-modal" role="dialog" aria-modal="true" :aria-label="editing.kind === 'comp' ? '编辑总结' : '编辑摘要'">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">
             {{ editing.kind === 'comp' ? `编辑${levelLabel(editing.level)}` : `编辑摘要 · 楼层 #${editing.msgIndex}` }}

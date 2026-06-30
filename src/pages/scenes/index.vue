@@ -324,7 +324,7 @@ const removeChildCount = computed(() => {
     </div>
 
     <!-- 添加弹窗:选上级(已有地点 / 顶级)+ 填新名 + 描述 -->
-    <ModalMask v-if="composerOpen" @close="closeComposer">
+    <ModalMask :open="composerOpen" @close="closeComposer">
       <div class="bbs-modal" role="dialog" aria-modal="true" aria-label="添加地点">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">添加地点</span>
@@ -355,8 +355,8 @@ const removeChildCount = computed(() => {
     </ModalMask>
 
     <!-- 编辑弹窗:Teleport 出滚动容器,见 ModalMask -->
-    <ModalMask v-if="editing" @close="cancelEdit">
-      <div class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑地点">
+    <ModalMask :open="!!editing" @close="cancelEdit">
+      <div v-if="editing" class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑地点">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">编辑地点</span>
           <button class="bbs-item-act" type="button" title="关闭" @click="cancelEdit"><Icon name="close" /></button>

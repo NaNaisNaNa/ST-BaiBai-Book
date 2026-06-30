@@ -57,35 +57,37 @@ function confirm() {
 
 <template>
   <Teleport :to="modalHost" :disabled="!modalHost">
-    <div
-      v-if="open"
-      class="bbs-modal-mask"
-      :class="{ 'bbs-modal-mask-top': topLayer }"
-      @click.self="cancel"
-    >
-      <div class="bbs-modal bbs-modal-confirm" role="dialog" aria-modal="true" :aria-label="title">
-        <header class="bbs-modal-head">
-          <span class="bbs-modal-title">{{ title }}</span>
-        </header>
-        <p class="bbs-confirm-text">
-          <slot />
-        </p>
-        <footer class="bbs-modal-foot">
-          <span class="bbs-modal-foot-spacer"></span>
-          <button class="bbs-btn" type="button" @click="cancel">{{ cancelText }}</button>
-          <button
-            class="bbs-btn"
-            :class="tone === 'danger' ? 'bbs-btn-danger' : 'bbs-btn-primary'"
-            type="button"
-            :disabled="busy"
-            @click="confirm"
-          >
-            <Icon v-if="confirmIcon" :name="confirmIcon" />
-            {{ busy && busyText ? busyText : confirmText }}
-          </button>
-        </footer>
+    <Transition name="bbs-modal">
+      <div
+        v-if="open"
+        class="bbs-modal-mask"
+        :class="{ 'bbs-modal-mask-top': topLayer }"
+        @click.self="cancel"
+      >
+        <div class="bbs-modal bbs-modal-confirm" role="dialog" aria-modal="true" :aria-label="title">
+          <header class="bbs-modal-head">
+            <span class="bbs-modal-title">{{ title }}</span>
+          </header>
+          <p class="bbs-confirm-text">
+            <slot />
+          </p>
+          <footer class="bbs-modal-foot">
+            <span class="bbs-modal-foot-spacer"></span>
+            <button class="bbs-btn" type="button" @click="cancel">{{ cancelText }}</button>
+            <button
+              class="bbs-btn"
+              :class="tone === 'danger' ? 'bbs-btn-danger' : 'bbs-btn-primary'"
+              type="button"
+              :disabled="busy"
+              @click="confirm"
+            >
+              <Icon v-if="confirmIcon" :name="confirmIcon" />
+              {{ busy && busyText ? busyText : confirmText }}
+            </button>
+          </footer>
+        </div>
       </div>
-    </div>
+    </Transition>
   </Teleport>
 </template>
 

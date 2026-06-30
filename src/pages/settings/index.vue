@@ -1289,8 +1289,8 @@ function scorePct(score: number): number {
     </ConfirmDialog>
 
     <!-- ===== 渠道编辑弹窗 ===== -->
-    <ModalMask v-if="editingChannel" @close="closeChannel">
-      <div class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑渠道">
+    <ModalMask :open="!!editingChannel" @close="closeChannel">
+      <div v-if="editingChannel" class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑渠道">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">编辑渠道</span>
           <button class="bbs-icon-mini" type="button" title="关闭" @click="closeChannel"><Icon name="close" /></button>
@@ -1406,25 +1406,27 @@ function scorePct(score: number): number {
           </button>
           <button class="bbs-btn bbs-btn-primary" type="button" @click="confirmChannel">完成</button>
         </footer>
-      </div>
 
-      <!-- 删除渠道二次确认:叠在渠道弹窗之上 -->
-      <ConfirmDialog
-        v-model:open="confirmDeleteOpen"
-        title="删除渠道"
-        confirm-text="删除"
-        confirm-icon="trash"
-        tone="danger"
-        top-layer
-        @confirm="confirmRemoveChannel"
-      >
-        确定删除渠道「{{ editingChannel.name || '未命名渠道' }}」吗?此操作不可撤销,已指派该渠道的任务会被清空。
-      </ConfirmDialog>
+        <!-- 删除渠道二次确认:叠在渠道弹窗之上。置于 v-if="editingChannel" 块内,
+             渠道为 null 时整体不渲染——既合语义,也让 editingChannel.name 类型收窄。
+             ConfirmDialog 自身 teleport + top-layer,放这儿不影响其渲染层级。 -->
+        <ConfirmDialog
+          v-model:open="confirmDeleteOpen"
+          title="删除渠道"
+          confirm-text="删除"
+          confirm-icon="trash"
+          tone="danger"
+          top-layer
+          @confirm="confirmRemoveChannel"
+        >
+          确定删除渠道「{{ editingChannel.name || '未命名渠道' }}」吗?此操作不可撤销,已指派该渠道的任务会被清空。
+        </ConfirmDialog>
+      </div>
     </ModalMask>
 
     <!-- ===== 提示词编辑弹窗 ===== -->
-    <ModalMask v-if="editingPrompt" @close="closePrompt">
-      <div class="bbs-modal bbs-modal-wide" role="dialog" aria-modal="true" :aria-label="`编辑${editingPrompt.label}`">
+    <ModalMask :open="!!editingPrompt" @close="closePrompt">
+      <div v-if="editingPrompt" class="bbs-modal bbs-modal-wide" role="dialog" aria-modal="true" :aria-label="`编辑${editingPrompt.label}`">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">编辑{{ editingPrompt.label }}</span>
           <button class="bbs-icon-mini" type="button" title="关闭" @click="closePrompt"><Icon name="close" /></button>
@@ -1467,7 +1469,7 @@ function scorePct(score: number): number {
     </ModalMask>
 
     <!-- ===== 排除角色弹窗:搜索 + 勾选列表 ===== -->
-    <ModalMask v-if="excludeOpen" @close="closeExclude">
+    <ModalMask :open="excludeOpen" @close="closeExclude">
       <div class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑排除名单">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">排除角色</span>

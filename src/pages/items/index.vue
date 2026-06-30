@@ -114,8 +114,8 @@ function saveEdit() {
     </div>
 
     <!-- 编辑弹窗:Teleport 出滚动容器,见 ModalMask -->
-    <ModalMask v-if="editing" @close="cancelEdit">
-      <div class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑物品">
+    <ModalMask :open="!!editing" @close="cancelEdit">
+      <div v-if="editing" class="bbs-modal" role="dialog" aria-modal="true" aria-label="编辑物品">
         <header class="bbs-modal-head">
           <span class="bbs-modal-title">编辑物品</span>
           <button class="bbs-item-act" type="button" title="关闭" @click="cancelEdit"><Icon name="close" /></button>

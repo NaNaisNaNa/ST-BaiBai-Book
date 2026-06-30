@@ -206,7 +206,6 @@
   padding: 24px;
   background: var(--bbs-overlay);
   backdrop-filter: blur(3px);
-  animation: bbs-mask-in 0.15s var(--bbs-ease);
 }
 .bbs-modal {
   width: 100%;
@@ -222,7 +221,6 @@
   background: var(--bbs-bg);
   border: 1px solid var(--bbs-line);
   box-shadow: var(--bbs-shadow);
-  animation: bbs-card-in 0.15s var(--bbs-ease);
 }
 /* 标题栏固定:弹窗内容超长时整体滚动,但标题+关闭键随 sticky 钉在顶部不跟滚。
    负 margin 抵消 .bbs-modal 的 18px 内边距,让标题栏横向铺满、滚动时其不透明背景
@@ -260,26 +258,35 @@
   gap: 10px;
 }
 
-/* —— 弹窗入场动画:比窗口(--bbs-dur 0.28s)更快更利落,~0.15s,不墨迹。
-   用纯 CSS animation(挂载即播,天然 appear)而非 Vue Transition:各页弹窗由调用方 v-if 控制,
-   改 Transition 需把 v-if 改成 open prop、slot 会常驻求值导致 null 访问报错(editingChannel.name 等)。
-   animation 零调用方改动、无 null 风险。代价是关闭不带动画——对「利落不墨迹」反而合适。
-   遮罩淡入(@keyframes bbs-mask-in),卡片同时轻微上移+缩放(bbs-card-in)。 */
-@keyframes bbs-mask-in {
-  from {
-    opacity: 0;
-  }
+/* —— 弹窗进出场:比窗口(--bbs-dur 0.28s)更快更利落,~0.15s,不墨迹。开关都带动画。
+   Vue Transition name="bbs-modal",由 ModalMask / ConfirmDialog 内部常驻的 Transition 驱动
+   (容器常驻、内部 v-if 切换弹窗,故离场也能播)。遮罩(.bbs-modal-mask)是过渡根元素,
+   卡片(.bbs-modal)靠后代选择器联动——与 App.vue 窗口同款手法。 */
+.bbs-modal-enter-active,
+.bbs-modal-leave-active {
+  transition: opacity 0.15s var(--bbs-ease);
 }
-@keyframes bbs-card-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px) scale(0.97);
-  }
+.bbs-modal-enter-active .bbs-modal,
+.bbs-modal-leave-active .bbs-modal {
+  transition:
+    opacity 0.15s var(--bbs-ease),
+    transform 0.15s var(--bbs-ease);
+}
+.bbs-modal-enter-from,
+.bbs-modal-leave-to {
+  opacity: 0;
+}
+.bbs-modal-enter-from .bbs-modal,
+.bbs-modal-leave-to .bbs-modal {
+  opacity: 0;
+  transform: translateY(8px) scale(0.97);
 }
 @media (prefers-reduced-motion: reduce) {
-  .bbs-modal-mask,
-  .bbs-modal {
-    animation: none !important;
+  .bbs-modal-enter-active,
+  .bbs-modal-leave-active,
+  .bbs-modal-enter-active .bbs-modal,
+  .bbs-modal-leave-active .bbs-modal {
+    transition: none;
   }
 }
 
