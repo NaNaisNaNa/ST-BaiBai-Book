@@ -279,7 +279,7 @@ function applyImport() {
         v-model="editorMeaning"
         class="bbs-input bbs-modal-textarea"
         rows="3"
-        placeholder="如:势力 是一组势力对象,键=势力名,每个含 立场(中立/敌对/结盟)、声望(0-100)、领袖、据点。"
+        placeholder="如:xxx好感度指的是该角色对{{user}}的好感度,角色好感度的不同,行为表现也会不同。"
       ></textarea>
     </label>
     <label class="bbs-modal-field">
@@ -288,7 +288,7 @@ function applyImport() {
         v-model="editorRule"
         class="bbs-input bbs-modal-textarea"
         rows="3"
-        placeholder="如:遇到新势力用 assign 在 势力 下新建;声望随事件用 add 调整。不确定就别动。"
+        placeholder="如: 角色每次和{{user}}触发事件时,好感度都会变化,但每次浮动不得超过5"
       ></textarea>
     </label>
     <div class="bbs-modal-foot bbs-var-savefoot">

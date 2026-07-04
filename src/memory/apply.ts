@@ -395,6 +395,32 @@ export function mergeTemplates(t: Record<VarTier, VarTemplate>): Record<string, 
   return deepMerge(deepMerge(deepCloneJson(t.global.json), t.char.json), t.chat.json);
 }
 
+/**
+ * 在**重放起点(seed)**展开变量模板里的 ST 宏({{user}}/{{char}}/… 全套,走 substituteParams)。
+ * 深走整棵 JSON:对象的**键**与所有**字符串值**都替换;数字/布尔/null 原样。
+ *
+ * 为何只在 seed 展开(而非注入时):宏只可能来自用户填的模板;AI 与手动命令产出的永远是真实值。
+ * 故把「字面模板」在合并成初始状态的那一刻替换成真实名,之后 fold 各楼 VarOps 全程真实名、
+ * 天然对齐——无需把 AI 输出的真实名反向映射回 {{user}}(那会因同名/群聊/改名而脆)。
+ * 模板本身仍存字面宏(saveMemory 只存模板,mem.vars 是派生缓存不落盘),故全局变量跨角色可移植:
+ * 切角色后重新 seed 即得新角色名。ST 未就绪 / 无 substituteParams 时原样返回(降级不炸)。
+ */
+export function expandVarMacros(json: Record<string, JsonValue>): Record<string, JsonValue> {
+  const sub = getContext()?.substituteParams;
+  if (typeof sub !== 'function') return json; // 降级:拿不到宏展开就用字面值
+  const walk = (v: JsonValue): JsonValue => {
+    if (typeof v === 'string') return sub(v);
+    if (Array.isArray(v)) return v.map(walk);
+    if (isPlainObj(v)) {
+      const out: Record<string, JsonValue> = {};
+      for (const k of Object.keys(v)) out[sub(k)] = walk(v[k]); // 键也展开
+      return out;
+    }
+    return v;
+  };
+  return walk(json) as Record<string, JsonValue>;
+}
+
 /** 解析路径成段:"势力.魔法议会[0].声望" → ['势力','魔法议会',0,'声望'];''→[]。 */
 function parsePath(path: string): (string | number)[] {
   const segs: (string | number)[] = [];
@@ -768,7 +794,8 @@ export function deriveMemory(
   upToExclusive?: number,
 ): Pick<BaibaiMemory, 'state' | 'items' | 'plans' | 'scenes' | 'npcs' | 'itemLog' | 'vars'> {
   const mem = createEmptyMemory();
-  mem.vars = mergeTemplates(memory.varTemplates); // 变量从三层合并模板起算(无 chat 也返回初始状态)
+  // 变量从三层合并模板起算(无 chat 也返回初始状态);seed 时展开模板里的 ST 宏({{user}} 等)
+  mem.vars = expandVarMacros(mergeTemplates(memory.varTemplates));
   if (!chat) return { state: mem.state, items: mem.items, plans: mem.plans, scenes: mem.scenes, npcs: mem.npcs, itemLog: mem.itemLog, vars: mem.vars };
   const end = typeof upToExclusive === 'number' ? Math.min(upToExclusive, chat.length) : chat.length;
   for (let i = 0; i < end; i++) {
