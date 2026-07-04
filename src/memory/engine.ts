@@ -3,7 +3,7 @@ import { mainApiAvailable, requestCompletion, requestViaMainApi } from '@/api/cl
 import { apiSettings, engineActiveHere, getChannelForTask } from '@/api/settings';
 import type { TaskType } from '@/api/settings';
 import type { STMessage, WorldInfoEntry } from '@/st/context';
-import { getContext, getCheckWorldInfo } from '@/st/context';
+import { getContext, getCheckWorldInfo, setMessageText } from '@/st/context';
 import { toast } from '@/st/toast';
 import { addSummary, deriveMemory, finalizeDelta, fmtVarOpsInline, getLeaf, itemChangesOf, leafValid, makeLeafId, pruneBrokenComps, syncItemLogFromMessage } from './apply';
 import { extractJsonObject } from './json';
@@ -788,10 +788,11 @@ function applyLeafForFloor(
   // 把本楼物品净变动写进正文 </bbs_end> 之后(<bbs_items> 旁注,正则隐藏、不进副API摘要)。
   // 用 stateBefore.items(本楼之前的物品)作基准算 from→to;无变动则只清旧块。
   const changes = itemChangesOf(storedDelta, stateBefore.items, timeEnd || timeStart || '');
-  chat[aiFloor].mes = writeItemLogTag(chat[aiFloor].mes, fmtItemLogInline(changes));
+  let mes = writeItemLogTag(chat[aiFloor].mes, fmtItemLogInline(changes));
   // 自定义变量净变动同样写进正文 <bbs_vars>(紧随物品块,正则隐藏、不进副API摘要),
   // 让窗口内全文楼层的主模型看到「本楼已改过这些变量」,防重复改(与物品旁注同机制)。
-  chat[aiFloor].mes = writeVarLogTag(chat[aiFloor].mes, fmtVarOpsInline(storedDelta.varOps));
+  mes = writeVarLogTag(mes, fmtVarOpsInline(storedDelta.varOps));
+  setMessageText(chat[aiFloor], mes);
 }
 
 /**

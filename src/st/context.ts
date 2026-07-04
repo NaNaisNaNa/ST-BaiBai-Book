@@ -9,6 +9,8 @@ export interface STMessage {
   is_user: boolean;
   is_system: boolean;
   mes: string;
+  /** ST 当前消息的所有 swipe 正文。单页 AI 回复通常也有 swipes[0]。 */
+  swipes?: string[];
   send_date?: string;
   /** 当前显示的 swipe 页码(多页 AI 回复时)。单页/无 swipe 时可能为 undefined,按 0 处理 */
   swipe_id?: number;
@@ -162,6 +164,20 @@ export function getContext(): STContext | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 更新消息正文时同步当前 swipe。
+ *
+ * ST 的保存格式里 `mes` 和 `swipes[swipe_id]` 都会存在；只改 `mes` 会造成当前页
+ * 文本与 swipe 备份分裂。所有插件内部正文写回都走这里。
+ */
+export function setMessageText(message: STMessage | undefined, text: string): void {
+  if (!message) return;
+  message.mes = text;
+  if (!Array.isArray(message.swipes)) return;
+  const idx = typeof message.swipe_id === 'number' ? message.swipe_id : 0;
+  if (idx >= 0 && idx < message.swipes.length) message.swipes[idx] = text;
 }
 
 /**

@@ -1,4 +1,4 @@
-import { getContext, type STMessage } from '@/st/context';
+import { getContext, setMessageText, type STMessage } from '@/st/context';
 import { fmtItemLogInline } from './prompts';
 import { memory, recomputeDerived, saveMemory, scheduleLeafFlush } from './store';
 import { readItemsTagText, writeItemLogTag, writeVarLogTag } from './timeTag';
@@ -905,7 +905,7 @@ export function syncItemLogFromMessage(index: number): boolean {
 
   // 正文旁注重写成规范格式(用规范化后的 delta 重新渲染)
   const canonical = fmtItemLogInline(itemChangesOf(leaf.delta, prior, time));
-  chat[index].mes = writeItemLogTag(chat[index].mes, canonical);
+  setMessageText(chat[index], writeItemLogTag(chat[index].mes, canonical));
 
   recomputeDerived();
   pruneBrokenComps();
@@ -1443,8 +1443,9 @@ function rewriteFloorTags(chat: STMessage[], index: number, delta: StoredDelta):
   const leaf = getLeaf(chat[index]);
   const time = leaf?.timeEnd?.trim() || leaf?.timeStart?.trim() || '';
   const priorItems = deriveMemory(chat, index).items;
-  chat[index].mes = writeItemLogTag(chat[index].mes, fmtItemLogInline(itemChangesOf(delta, priorItems, time)));
-  chat[index].mes = writeVarLogTag(chat[index].mes, fmtVarOpsInline(delta.varOps));
+  let mes = writeItemLogTag(chat[index].mes, fmtItemLogInline(itemChangesOf(delta, priorItems, time)));
+  mes = writeVarLogTag(mes, fmtVarOpsInline(delta.varOps));
+  setMessageText(chat[index], mes);
 }
 
 /**

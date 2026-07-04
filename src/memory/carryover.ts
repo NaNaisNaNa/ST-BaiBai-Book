@@ -13,7 +13,7 @@
  * 使新对话能向量召回源聊天的旧剧情。
  */
 
-import { getContext, getDoNewChat, type STMessage } from '@/st/context';
+import { getContext, getDoNewChat, setMessageText, type STMessage } from '@/st/context';
 import { toast } from '@/st/toast';
 import { apiSettings } from '@/api/settings';
 import { deriveMemory, makeLeafId } from './apply';
@@ -234,7 +234,7 @@ export async function createNewChatWithCarryover(): Promise<boolean> {
       targetChat.push(anchor);
     }
     anchor.is_system = true;
-    anchor.mes = '';
+    setMessageText(anchor, '');
     // 种子叶子挂 #0.extra
     const seedLeaf: LeafExtra = {
       id: makeLeafId(),

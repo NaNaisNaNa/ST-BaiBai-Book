@@ -142,14 +142,156 @@ export function stripThinkBlocks(mes: string): string {
   return String(mes ?? '').replace(RE_THINK_BLOCK, '');
 }
 
+/** 末次匹配结束位置;找不到返回 -1。 */
+function lastRegexEnd(s: string, re: RegExp): number {
+  let last = -1;
+  re.lastIndex = 0;
+  for (let m = re.exec(s); m; m = re.exec(s)) last = m.index + m[0].length;
+  return last;
+}
+
+/**
+ * 插件托管旁注块的安全形态:开/闭标签都独占一行。
+ * 闭合标签配最近的独占行开标签,且块内容必须像本插件写出的旁注行。
+ * 这样不会把模型在思维链/正文里写出的 `<bbs_vars>` 格式说明误当旁注开头。
+ */
+interface LineSpan {
+  start: number;
+  end: number;
+  text: string;
+}
+
+interface ManagedBlock {
+  start: number;
+  end: number;
+  innerStart: number;
+  innerEnd: number;
+}
+
+function lineSpans(s: string): LineSpan[] {
+  const lines: LineSpan[] = [];
+  let pos = 0;
+  while (pos < s.length) {
+    const nl = s.indexOf('\n', pos);
+    const end = nl >= 0 ? nl + 1 : s.length;
+    const raw = s.slice(pos, end);
+    lines.push({ start: pos, end, text: raw.replace(/\r?\n$/, '') });
+    pos = end;
+  }
+  return lines;
+}
+
+function isManagedOpenLine(line: string, tag: string): boolean {
+  return new RegExp(`^[ \\t]*<${tag}\\b[^>]*>[ \\t]*$`, 'i').test(line);
+}
+
+function isManagedCloseLine(line: string, tag: string): boolean {
+  return new RegExp(`^[ \\t]*</${tag}>[ \\t]*$`, 'i').test(line);
+}
+
+function managedBlockLooksOwned(tag: string, inner: string): boolean {
+  const lines = inner.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  if (!lines.length) return false;
+  const re = tag === ITEMS_TAG ? /^(获得|消耗|失去)\s+/ : /^(设定|变更|新增|删除)\s+/;
+  return lines.every(line => re.test(line));
+}
+
+function managedBlocks(s: string, tag: string): ManagedBlock[] {
+  const stack: Array<{ start: number; innerStart: number }> = [];
+  const blocks: ManagedBlock[] = [];
+  for (const line of lineSpans(s)) {
+    if (isManagedOpenLine(line.text, tag)) {
+      stack.push({ start: line.start, innerStart: line.end });
+    } else if (isManagedCloseLine(line.text, tag) && stack.length) {
+      const open = stack.pop()!;
+      const inner = s.slice(open.innerStart, line.start);
+      if (managedBlockLooksOwned(tag, inner)) {
+        blocks.push({ start: open.start, end: line.end, innerStart: open.innerStart, innerEnd: line.start });
+      }
+    }
+  }
+  return blocks;
+}
+
+function stripManagedLineBlocks(region: string, tag: string): string {
+  const blocks = managedBlocks(region, tag).sort((a, b) => b.start - a.start);
+  let out = region;
+  for (const b of blocks) out = out.slice(0, b.start) + out.slice(b.end);
+  return out;
+}
+
+/** 无时间标签旧消息兜底:只把末尾连续的插件旁注组视作托管块。 */
+function tailManagedGroupStart(s: string): number {
+  const matches = [...managedBlocks(s, ITEMS_TAG), ...managedBlocks(s, VARS_TAG)]
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  if (!matches.length) return -1;
+
+  let pos = s.length;
+  let start = -1;
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const m = matches[i];
+    if (s.slice(m.end, pos).trim()) break;
+    start = m.start;
+    pos = m.start;
+  }
+  return start;
+}
+
+function managedRegionStart(s: string): number {
+  const endPos = lastRegexEnd(s, RE_END_CLOSE_G);
+  if (endPos >= 0) return endPos;
+  return tailManagedGroupStart(s);
+}
+
+/** 只删除插件真正托管的尾部旁注块,不碰正文/思维链里的同名标签文字。 */
+function stripManagedTag(mes: string, tag: string): string {
+  const s = String(mes ?? '');
+  const start = managedRegionStart(s);
+  if (start < 0) return s;
+  return s.slice(0, start) + stripManagedLineBlocks(s.slice(start), tag);
+}
+
+function stripManagedTags(mes: string): string {
+  return stripManagedTag(stripManagedTag(mes, ITEMS_TAG), VARS_TAG);
+}
+
+function lastManagedBlockEnd(mes: string, tag: string): number {
+  const s = String(mes ?? '');
+  const start = managedRegionStart(s);
+  if (start < 0) return -1;
+  const blocks = managedBlocks(s.slice(start), tag);
+  const last = blocks[blocks.length - 1];
+  return last ? start + last.end : -1;
+}
+
+function readManagedTagText(mes: string, tag: string): string | null {
+  const s = String(mes ?? '');
+  const start = managedRegionStart(s);
+  if (start < 0) return null;
+  const block = managedBlocks(s.slice(start), tag)[0];
+  return block ? s.slice(start + block.innerStart, start + block.innerEnd).trim() : null;
+}
+
+function cropToContentBlock(s: string): string {
+  const openRe = /<content\b[^>]*>/gi;
+  let lastOpen: { start: number; end: number } | null = null;
+  for (let m = openRe.exec(s); m; m = openRe.exec(s)) {
+    lastOpen = { start: m.index, end: m.index + m[0].length };
+  }
+  if (!lastOpen) return s;
+  const rest = s.slice(lastOpen.end);
+  const close = rest.match(/<\/content>/i);
+  return close && close.index !== undefined ? rest.slice(0, close.index) : rest;
+}
+
 export function clampToTimeTags(mes: string): string {
   let s = String(mes ?? '')
     .replace(RE_THINK_BLOCK, '') // 思维链
     .replace(/<!--[\s\S]+?-->/g, '') // HTML 注释
-    .replace(/<horae[\s\S]*?>[\s\S]*?<\/horae[\s\S]*?>/gi, '') // 旧 horae 格式
-    .replace(RE_ITEMS_BLOCK, '') // 物品变动旁注(插件写进正文,不该进摘要/索引)
-    .replace(RE_VARS_BLOCK, ''); // 变量变动旁注(同上)
+    .replace(/<horae[\s\S]*?>[\s\S]*?<\/horae[\s\S]*?>/gi, ''); // 旧 horae 格式
   s = stripCustomTags(s); // 用户自定义标签
+  s = cropToContentBlock(s); // 未闭合 thinking 或格式说明里的伪时间标签不应参与裁剪
+  s = stripManagedTags(s); // 仅清理插件托管的尾部旁注
 
   // 最后一个 <bbs_start> 的位置:全局扫一遍取末次
   const startRe = new RegExp(`<${START_TAG}\\b`, 'gi');
@@ -249,9 +391,6 @@ export function splitTimeLabel(label?: string): { start?: string; end?: string }
   return { start: s.slice(0, i).trim() || undefined, end: s.slice(i + 3).trim() || undefined };
 }
 
-// 物品变动块:删旧用(整段,含标签)
-const RE_ITEMS_BLOCK = new RegExp(`\\n*<${ITEMS_TAG}\\b[^>]*>[\\s\\S]*?</${ITEMS_TAG}>`, 'gi');
-
 // 定位「最后一个 </bbs_end>」用(全局扫,取末次):正文末尾的时间标签才是真正的剧情结束,
 // 思维链/状态栏可能在前面混入同名标签,故不能用第一个(见 clampToTimeTags 同款考量)。
 const RE_END_CLOSE_G = new RegExp(`</${END_TAG}>`, 'gi');
@@ -263,37 +402,25 @@ const RE_END_CLOSE_G = new RegExp(`</${END_TAG}>`, 'gi');
  * 返回处理后的正文(调用方负责写回 mes)。
  */
 export function writeItemLogTag(mes: string, inline: string): string {
-  let s = String(mes ?? '').replace(RE_ITEMS_BLOCK, '');
+  let s = stripManagedTag(mes, ITEMS_TAG);
   const text = inline.trim();
   if (!text) return s;
   // 标签与内容各自独占行,块前留空行,排版清爽且不与时间标签粘连
   const block = `<${ITEMS_TAG}>\n${text}\n</${ITEMS_TAG}>`;
-  // 取最后一个 </bbs_end> 的结束位置
-  let lastEnd = -1;
-  RE_END_CLOSE_G.lastIndex = 0;
-  for (let m = RE_END_CLOSE_G.exec(s); m; m = RE_END_CLOSE_G.exec(s)) lastEnd = m.index + m[0].length;
+  const lastEnd = lastRegexEnd(s, RE_END_CLOSE_G);
   if (lastEnd >= 0) {
     return `${s.slice(0, lastEnd)}\n${block}${s.slice(lastEnd)}`;
   }
   return `${s.trimEnd()}\n${block}`;
 }
 
-// 提取 <bbs_items> 块内文本用
-const RE_ITEMS_INNER = new RegExp(`<${ITEMS_TAG}\\b[^>]*>([\\s\\S]*?)</${ITEMS_TAG}>`, 'i');
-
 /**
  * 读取正文里的 <bbs_items> 块内文本(去首尾空白)。
  * 无块返回 null(区别于「有块但空」——后者返回 ''),供反解析判断用户是否删了整块。
  */
 export function readItemsTagText(mes: string): string | null {
-  const m = String(mes ?? '').match(RE_ITEMS_INNER);
-  return m ? m[1].trim() : null;
+  return readManagedTagText(mes, ITEMS_TAG);
 }
-
-// 变量变动块:删旧用(整段,含标签)
-const RE_VARS_BLOCK = new RegExp(`\\n*<${VARS_TAG}\\b[^>]*>[\\s\\S]*?</${VARS_TAG}>`, 'gi');
-// 定位物品块结束位置用(变量块紧随物品块之后):取末次
-const RE_ITEMS_CLOSE_G = new RegExp(`</${ITEMS_TAG}>`, 'gi');
 
 /**
  * 把变量变动旁注写进正文:先删旧 <bbs_vars> 块(幂等),再插到**物品块之后**(无物品块则最后一个 </bbs_end> 之后,
@@ -301,30 +428,20 @@ const RE_ITEMS_CLOSE_G = new RegExp(`</${ITEMS_TAG}>`, 'gi');
  * inline 为空 → 只清旧块不写新块。返回处理后的正文。
  */
 export function writeVarLogTag(mes: string, inline: string): string {
-  const s = String(mes ?? '').replace(RE_VARS_BLOCK, '');
+  const s = stripManagedTag(mes, VARS_TAG);
   const text = inline.trim();
   if (!text) return s;
   const block = `<${VARS_TAG}>\n${text}\n</${VARS_TAG}>`;
   // 锚点优先:最后一个 </bbs_items> 结束位置;否则最后一个 </bbs_end>;都无则追加末尾
-  const lastOf = (re: RegExp): number => {
-    let last = -1;
-    re.lastIndex = 0;
-    for (let m = re.exec(s); m; m = re.exec(s)) last = m.index + m[0].length;
-    return last;
-  };
-  const anchor = lastOf(RE_ITEMS_CLOSE_G);
-  const pos = anchor >= 0 ? anchor : lastOf(RE_END_CLOSE_G);
+  const anchor = lastManagedBlockEnd(s, ITEMS_TAG);
+  const pos = anchor >= 0 ? anchor : lastRegexEnd(s, RE_END_CLOSE_G);
   if (pos >= 0) return `${s.slice(0, pos)}\n${block}${s.slice(pos)}`;
   return `${s.trimEnd()}\n${block}`;
 }
 
-// 提取 <bbs_vars> 块内文本用
-const RE_VARS_INNER = new RegExp(`<${VARS_TAG}\\b[^>]*>([\\s\\S]*?)</${VARS_TAG}>`, 'i');
-
 /** 读取正文里的 <bbs_vars> 块内文本(去首尾空白);无块返回 null(供反解析判断用户是否删了整块)。 */
 export function readVarsTagText(mes: string): string | null {
-  const m = String(mes ?? '').match(RE_VARS_INNER);
-  return m ? m[1].trim() : null;
+  return readManagedTagText(mes, VARS_TAG);
 }
 
 /* ============ 自动注册「仅显示层隐藏」正则到 ST ============ */
@@ -341,8 +458,11 @@ const PLACEMENT_AI_OUTPUT = 2;
 
 /** 一条同时吃掉 start/end/items/vars 标签(含其内部内容)的正则字符串(ST 用 /pattern/flags 形式) */
 function hideFindRegex(): string {
-  const tags = `${START_TAG}|${END_TAG}|${ITEMS_TAG}|${VARS_TAG}`;
-  return `/<\\/?(?:${tags})\\b[^>]*>(?:[\\s\\S]*?<\\/(?:${tags})>)?/gi`;
+  const timeTags = `${START_TAG}|${END_TAG}`;
+  const items = `(^|\\r?\\n)[ \\t]*<${ITEMS_TAG}\\b[^>]*>[ \\t]*\\r?\\n(?:[ \\t]*(?:获得|消耗|失去)\\s+[^\\r\\n]*(?:\\r?\\n))+[ \\t]*<\\/${ITEMS_TAG}>[ \\t]*(?=\\r?\\n|$)`;
+  const vars = `(^|\\r?\\n)[ \\t]*<${VARS_TAG}\\b[^>]*>[ \\t]*\\r?\\n(?:[ \\t]*(?:设定|变更|新增|删除)\\s+[^\\r\\n]*(?:\\r?\\n))+[ \\t]*<\\/${VARS_TAG}>[ \\t]*(?=\\r?\\n|$)`;
+  // 旁注块只隐藏「独占行 + 插件动词格式」;时间标签则隐藏成对标签里的时间文本。
+  return `/${items}|${vars}|<(${timeTags})\\b[^>]*>[\\s\\S]*?<\\/\\3>/gi`;
 }
 
 /**
