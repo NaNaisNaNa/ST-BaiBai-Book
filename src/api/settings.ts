@@ -251,7 +251,7 @@ function defaults(): ApiSettings {
         rerankThreshold: 0.9,
         fullTextCount: 2,
         finalRecallCount: 5,
-        minAiFloors: 0,
+        minAiFloors: 30,
       },
     },
     channels: [],

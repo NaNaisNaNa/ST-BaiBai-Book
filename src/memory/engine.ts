@@ -14,9 +14,23 @@ import { memory, recomputeDerived, scheduleLeafFlush } from './store';
 import type { LeafExtra, SummaryDelta } from './types';
 import { scheduleVectorIndex } from './vector';
 import { clearRecallInjection } from './vector/recall';
+import { reactive, watch } from 'vue';
+
+function llmString(v: unknown): string {
+  return typeof v === 'string' ? v.trim() : '';
+}
+
+function llmScalar(v: unknown): string {
+  if (typeof v === 'string') return v.trim();
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v).trim();
+  return '';
+}
+
+function llmOptionalScalar(v: unknown): string | undefined {
+  return llmScalar(v) || undefined;
+}
 
 /** 引擎运行状态(供 UI 显示) */
-import { reactive, watch } from 'vue';
 export const engineState = reactive({
   running: false,
   lastError: '' as string,
@@ -811,14 +825,14 @@ function applyLeafForFloor(
   const storedDelta = finalizeDelta(delta, openPlansOrdered);
 
   // 时间起止:标签优先(与新剧情同源不漂移);标签缺的那端用 AI 补的 timeStart/timeEnd 兜底。
-  const timeStart = tag.start || delta.timeStart?.trim() || undefined;
-  const timeEnd = tag.end || delta.timeEnd?.trim() || delta.time?.trim() || undefined;
+  const timeStart = tag.start || llmOptionalScalar(delta.timeStart) || undefined;
+  const timeEnd = tag.end || llmOptionalScalar(delta.timeEnd) || llmOptionalScalar(delta.time) || undefined;
   // 状态当前时间(覆盖型):用结束时间(本段最后时刻);取不到则保留既有状态。
   if (timeEnd) storedDelta.time = timeEnd;
 
   const leaf: LeafExtra = {
     id: makeLeafId(),
-    text: (delta.summary ?? '').trim(),
+    text: llmString(delta.summary),
     delta: storedDelta,
     timeStart,
     timeEnd,
@@ -905,10 +919,11 @@ async function summarizeFloorWork(
   const delta = await sendAndParse(sender.send, messages, raw => {
     console.log('[柏宝书] 摘要原始返回(未清洗):\n', raw);
     const d = extractJsonObject<SummaryDelta>(raw);
-    if (!d || !d.summary) {
+    const summary = llmString(d?.summary);
+    if (!d || !summary) {
       throw new Error(raw.trim() ? '摘要失败:AI道歉或掉格式' : '摘要失败:AI空回');
     }
-    return d as SummaryDelta & { summary: string };
+    return { ...d, summary } as SummaryDelta & { summary: string };
   });
 
   applyLeafForFloor(chat, aiFloor, delta, stateBefore);
@@ -1067,10 +1082,15 @@ async function summarizeBatchWork(
     if (floors.length !== block.length) {
       throw new Error(`批量摘要失败:返回 ${floors.length} 楼,期望 ${block.length} 楼`);
     }
-    if (floors.some(f => !f || !f.summary)) {
+    const cleaned = floors.map(f => {
+      if (!f || typeof f !== 'object') return null;
+      const summary = llmString(f.summary);
+      return summary ? { ...f, summary } : null;
+    });
+    if (cleaned.some(f => !f)) {
       throw new Error('批量摘要失败:有楼层缺 summary');
     }
-    return floors;
+    return cleaned as Array<SummaryDelta & { summary: string }>;
   });
 
   // 逐楼落叶(块内顺序,严格按 block 升序)。批量只取 summary + 起止时间:
@@ -1207,8 +1227,8 @@ function thresholdForLevel(level: number): number {
 function joinNodesForResummary(nodes: Array<{ text: string; timeStart?: string; timeEnd?: string }>): string {
   return nodes
     .map((n, i) => {
-      const start = n.timeStart?.trim();
-      const end = n.timeEnd?.trim();
+      const start = llmOptionalScalar(n.timeStart);
+      const end = llmOptionalScalar(n.timeEnd);
       let time = '';
       if (start && end) time = start === end ? `(${start}) ` : `(${start} – ${end}) `;
       else if (start || end) time = `(${start || end}) `;
@@ -1238,14 +1258,14 @@ function rootsAtLevel(level: number, chat: STMessage[]): RootView[] {
       if (!leafValid(chat[i])) continue;
       const lf = getLeaf(chat[i]) as LeafExtra;
       if (collected.has(lf.id)) continue; // 已被某 L1 收纳
-      out.push({ id: lf.id, text: lf.text, createdAt: lf.createdAt, timeStart: lf.timeStart, timeEnd: lf.timeEnd }); // 已按楼层序
+      out.push({ id: lf.id, text: llmString(lf.text), createdAt: lf.createdAt, timeStart: llmOptionalScalar(lf.timeStart), timeEnd: llmOptionalScalar(lf.timeEnd) }); // 已按楼层序
     }
     return out;
   }
   return memory.summaries
     .filter(s => s.level === level && !collected.has(s.id))
     .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))
-    .map(s => ({ id: s.id, text: s.text, createdAt: s.createdAt, timeStart: s.timeStart, timeEnd: s.timeEnd }));
+    .map(s => ({ id: s.id, text: llmString(s.text), createdAt: s.createdAt, timeStart: llmOptionalScalar(s.timeStart), timeEnd: llmOptionalScalar(s.timeEnd) }));
 }
 
 /**
@@ -1292,12 +1312,13 @@ export async function checkResummary(): Promise<number> {
       const delta = await sendAndParse(sender.send, messages, raw => {
         console.log('[柏宝书] 总结原始返回(未清洗):\n', raw);
         const d = extractJsonObject<{ summary?: string }>(raw);
-        if (!d?.summary) {
+        const summary = llmString(d?.summary);
+        if (!summary) {
           // 输出层级 level+1:为 1 是普通总结,≥2 是二次总结;有文本=掉格式,空白=空回
           const what = level + 1 === 1 ? '总结' : '二次总结';
           throw new Error(raw.trim() ? `${what}失败:AI道歉或掉格式` : `${what}失败:AI空回`);
         }
-        return d as { summary: string };
+        return { summary };
       });
 
       // 生成上层节点收纳这批(**不删 batch**),时间戳取批内最新,排在它们之后
@@ -1352,7 +1373,7 @@ function collectSelectableNodes(chat: STMessage[]): Map<string, SelectableNode> 
     if (!leafValid(chat[i])) continue;
     const lf = getLeaf(chat[i]) as LeafExtra;
     leafFloor.set(lf.id, i);
-    map.set(lf.id, { id: lf.id, text: lf.text, level: 0, timeStart: lf.timeStart, timeEnd: lf.timeEnd, floorLo: i, floorHi: i });
+    map.set(lf.id, { id: lf.id, text: llmString(lf.text), level: 0, timeStart: llmOptionalScalar(lf.timeStart), timeEnd: llmOptionalScalar(lf.timeEnd), floorLo: i, floorHi: i });
   }
   // comp:递归解析后代叶子楼层
   const byComp = new Map(memory.summaries.map(s => [s.id, s]));
@@ -1370,7 +1391,7 @@ function collectSelectableNodes(chat: STMessage[]): Map<string, SelectableNode> 
     floorsOf(s.id, new Set(), floors);
     const lo = floors.length ? Math.min(...floors) : -1;
     const hi = floors.length ? Math.max(...floors) : -1;
-    map.set(s.id, { id: s.id, text: s.text, level: s.level, timeStart: s.timeStart, timeEnd: s.timeEnd, floorLo: lo, floorHi: hi });
+    map.set(s.id, { id: s.id, text: llmString(s.text), level: s.level, timeStart: llmOptionalScalar(s.timeStart), timeEnd: llmOptionalScalar(s.timeEnd), floorLo: lo, floorHi: hi });
   }
   return map;
 }
@@ -1443,11 +1464,12 @@ export async function summarizeSelected(nodeIds: string[]): Promise<{ made: numb
     const delta = await sendAndParse(sender.send, messages, raw => {
       console.log('[柏宝书] 强制总结原始返回(未清洗):\n', raw);
       const d = extractJsonObject<{ summary?: string }>(raw);
-      if (!d?.summary) {
+      const summary = llmString(d?.summary);
+      if (!summary) {
         const what = level === 1 ? '总结' : '二次总结';
         throw new Error(raw.trim() ? `${what}失败:AI道歉或掉格式` : `${what}失败:AI空回`);
       }
-      return d as { summary: string };
+      return { summary };
     });
 
     // 时间范围:picked 已按楼层升序 → 首个有起始的作 start,末个有结束的作 end(同 checkResummary)

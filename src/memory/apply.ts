@@ -21,6 +21,240 @@ function norm(s: string): string {
   return s.trim().toLowerCase();
 }
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+function scalarText(v: unknown): string {
+  if (typeof v === 'string') return v.trim();
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v).trim();
+  return '';
+}
+
+function optText(v: unknown): string | undefined {
+  return scalarText(v) || undefined;
+}
+
+function optBool(v: unknown): boolean | undefined {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (s === 'true') return true;
+    if (s === 'false') return false;
+  }
+  return undefined;
+}
+
+function optNumber(v: unknown): number | undefined {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : undefined;
+  if (typeof v === 'string' && v.trim()) {
+    const n = Number(v.trim());
+    return Number.isFinite(n) ? n : undefined;
+  }
+  return undefined;
+}
+
+function arr(v: unknown): unknown[] {
+  if (v === undefined || v === null) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+function namedText(v: unknown, keys: string[] = ['name', 'id', 'content']): string {
+  const direct = scalarText(v);
+  if (direct) return direct;
+  if (!isRecord(v)) return '';
+  for (const key of keys) {
+    const s = scalarText(v[key]);
+    if (s) return s;
+  }
+  return '';
+}
+
+function cleanTextList(v: unknown, keys?: string[]): string[] {
+  return arr(v).map(x => namedText(x, keys)).filter(Boolean);
+}
+
+function cleanPath(v: unknown): string[] {
+  if (Array.isArray(v)) return normScenePath(v);
+  const s = scalarText(v);
+  return s ? [s] : [];
+}
+
+function cleanItemDelta(raw: unknown): ItemDelta | null {
+  if (!isRecord(raw)) {
+    const name = scalarText(raw);
+    return name ? { name } : null;
+  }
+  const name = namedText(raw, ['name', 'item', 'id']);
+  if (!name) return null;
+  return {
+    name,
+    desc: optText(raw.desc),
+    qty: optNumber(raw.qty),
+    carried: optBool(raw.carried),
+    location: optText(raw.location),
+  };
+}
+
+function cleanItemList(v: unknown): ItemDelta[] {
+  return arr(v).map(cleanItemDelta).filter((x): x is ItemDelta => !!x);
+}
+
+function cleanSceneDelta(raw: unknown): SceneDelta | null {
+  if (!isRecord(raw)) return null;
+  const path = cleanPath(raw.path);
+  const desc = optText(raw.desc);
+  return path.length && desc ? { path, desc } : null;
+}
+
+function cleanSceneList(v: unknown): SceneDelta[] {
+  return arr(v).map(cleanSceneDelta).filter((x): x is SceneDelta => !!x);
+}
+
+function cleanSceneReparent(raw: unknown): SceneReparent | null {
+  if (!isRecord(raw)) return null;
+  const node = cleanPath(raw.node);
+  const newPath = cleanPath(raw.newPath);
+  if (!node.length || !newPath.length) return null;
+  const descs: Record<string, string> = {};
+  if (isRecord(raw.descs)) {
+    for (const [k, v] of Object.entries(raw.descs)) {
+      const key = scalarText(k);
+      const val = optText(v);
+      if (key && val) descs[key] = val;
+    }
+  }
+  return { node, newPath, descs };
+}
+
+function cleanSceneReparentList(v: unknown): SceneReparent[] {
+  return arr(v).map(cleanSceneReparent).filter((x): x is SceneReparent => !!x);
+}
+
+function cleanNpcDelta(raw: unknown): NpcDelta | null {
+  if (!isRecord(raw)) {
+    const name = scalarText(raw);
+    return name ? { name } : null;
+  }
+  const name = namedText(raw, ['name', 'npc', 'id']);
+  if (!name) return null;
+  return {
+    name,
+    gender: optText(raw.gender),
+    title: optText(raw.title),
+    desc: optText(raw.desc),
+    personality: optText(raw.personality),
+    outfit: optText(raw.outfit),
+    condition: optText(raw.condition),
+    important: optBool(raw.important),
+    follow: optBool(raw.follow),
+    location: optText(raw.location),
+  };
+}
+
+function cleanNpcList(v: unknown): NpcDelta[] {
+  return arr(v).map(cleanNpcDelta).filter((x): x is NpcDelta => !!x);
+}
+
+type PlanAdd = { kind: 'plan' | 'suspense'; content: string; createdTime?: string; targetTime?: string };
+
+function cleanPlanAdd(raw: unknown): PlanAdd | null {
+  if (!isRecord(raw)) {
+    const content = scalarText(raw);
+    return content ? { kind: 'plan', content } : null;
+  }
+  const content = namedText(raw, ['content', 'text', 'name']);
+  if (!content) return null;
+  return {
+    kind: raw.kind === 'suspense' ? 'suspense' : 'plan',
+    content,
+    createdTime: optText(raw.createdTime),
+    targetTime: optText(raw.targetTime),
+  };
+}
+
+function cleanPlanAddList(v: unknown): PlanAdd[] {
+  return arr(v).map(cleanPlanAdd).filter((x): x is PlanAdd => !!x);
+}
+
+function cleanStoredPlanResolve(raw: unknown): PlanResolveItem | null {
+  const id = namedText(raw, ['id', 'planId', 'ref']);
+  if (!id) return null;
+  if (!isRecord(raw)) return id;
+  const out: Exclude<PlanResolveItem, string> = { id };
+  if (raw.outcome === 'done' || raw.outcome === 'cancelled' || raw.outcome === 'failed') out.outcome = raw.outcome;
+  const reason = optText(raw.reason);
+  if (reason) out.reason = reason;
+  return out;
+}
+
+function cleanStoredPlanResolveList(v: unknown): PlanResolveItem[] {
+  return arr(v).map(cleanStoredPlanResolve).filter((x): x is PlanResolveItem => !!x);
+}
+
+function cleanStoredDelta(raw: StoredDelta): StoredDelta {
+  if (!isRecord(raw)) return {};
+  const out: StoredDelta = {};
+  const time = optText(raw.time);
+  const location = optText(raw.location);
+  const locationPath = cleanPath(raw.locationPath);
+  if (time) out.time = time;
+  if (location) out.location = location;
+  if (raw.locationPath !== undefined) out.locationPath = locationPath;
+
+  if (isRecord(raw.items)) {
+    const items: NonNullable<StoredDelta['items']> = {};
+    const add = cleanItemList(raw.items.add);
+    const update = cleanItemList(raw.items.update);
+    const remove = cleanTextList(raw.items.remove, ['name', 'item', 'id']);
+    if (add.length) items.add = add;
+    if (update.length) items.update = update;
+    if (remove.length) items.remove = remove;
+    if (Object.keys(items).length) out.items = items;
+  }
+
+  if (isRecord(raw.scenes)) {
+    const scenes: NonNullable<StoredDelta['scenes']> = {};
+    const add = cleanSceneList(raw.scenes.add);
+    const update = cleanSceneList(raw.scenes.update);
+    const reparent = cleanSceneReparentList(raw.scenes.reparent);
+    const remove = arr(raw.scenes.remove).map(cleanPath).filter(p => p.length);
+    if (add.length) scenes.add = add;
+    if (update.length) scenes.update = update;
+    if (reparent.length) scenes.reparent = reparent;
+    if (remove.length) scenes.remove = remove;
+    if (Object.keys(scenes).length) out.scenes = scenes;
+  }
+
+  if (isRecord(raw.npcs)) {
+    const npcs: NonNullable<StoredDelta['npcs']> = {};
+    const add = cleanNpcList(raw.npcs.add);
+    const update = cleanNpcList(raw.npcs.update);
+    const remove = cleanTextList(raw.npcs.remove, ['name', 'npc', 'id']);
+    if (add.length) npcs.add = add;
+    if (update.length) npcs.update = update;
+    if (remove.length) npcs.remove = remove;
+    if (Object.keys(npcs).length) out.npcs = npcs;
+  }
+
+  if (isRecord(raw.plans)) {
+    const plans: NonNullable<StoredDelta['plans']> = {};
+    const add = cleanPlanAddList(raw.plans.add);
+    const resolve = cleanStoredPlanResolveList(raw.plans.resolve);
+    const remove = cleanTextList(raw.plans.remove, ['id', 'planId']);
+    const reopen = cleanTextList(raw.plans.reopen, ['id', 'planId']);
+    if (add.length) plans.add = add;
+    if (resolve.length) plans.resolve = resolve;
+    if (remove.length) plans.remove = remove;
+    if (reopen.length) plans.reopen = reopen;
+    if (Object.keys(plans).length) out.plans = plans;
+  }
+
+  const varOps = finalizeVarOps(raw.varOps);
+  if (varOps.length) out.varOps = varOps;
+  return out;
+}
+
 /* ============ 确定性 id ============ */
 
 /** 物品 id:按规范化名,故重放幂等、手动 op 可稳定引用 */
@@ -176,7 +410,7 @@ export function planContentById(planIdStr: string): string {
   if (!chat) return '';
   for (let i = 0; i < chat.length; i++) {
     const lf = getLeaf(chat[i]);
-    if (lf?.id === leafId) return lf.delta?.plans?.add?.[addIdx]?.content?.trim() ?? '';
+    if (lf?.id === leafId) return scalarText(lf.delta?.plans?.add?.[addIdx]?.content);
   }
   return '';
 }
@@ -613,6 +847,7 @@ function applyStoredDeltaTo(mem: BaibaiMemory, d: StoredDelta, leaf: { id: strin
   const log = (kind: ItemLogEntry['kind'], name: string, from?: number, to?: number): void => {
     mem.itemLog.push({ name, kind, from, to, time: logTime });
   };
+  d = cleanStoredDelta(d);
 
   // 覆盖型:空串忽略
   if (typeof d.time === 'string' && d.time.trim()) mem.state.time = d.time.trim();
@@ -818,7 +1053,7 @@ export function deriveMemory(
     if (!leafValid(chat[i])) continue;
     const leaf = getLeaf(chat[i])!;
     // 日志用「故事内时间」:结束时间优先(本段最后时刻),缺则起始,再缺旧 timeLabel,最后空串
-    const time = leaf.timeEnd?.trim() || leaf.timeStart?.trim() || leaf.timeLabel?.trim() || '';
+    const time = optText(leaf.timeEnd) || optText(leaf.timeStart) || optText(leaf.timeLabel) || '';
     applyStoredDeltaTo(mem, leaf.delta, { id: leaf.id, createdAt: leaf.createdAt, time });
   }
   // 只留最近若干条变动(注入/喂模型够用即可,省 token)
@@ -890,7 +1125,7 @@ export function syncItemLogFromMessage(index: number): boolean {
 
   // 该楼之前的物品状态(用于把 delta 渲染成与正文同口径的旁注做比对)
   const prior = deriveMemory(chat, index).items;
-  const time = leaf.timeEnd?.trim() || leaf.timeStart?.trim() || leaf.timeLabel?.trim() || '';
+  const time = optText(leaf.timeEnd) || optText(leaf.timeStart) || optText(leaf.timeLabel) || '';
   const currentInline = fmtItemLogInline(itemChangesOf(leaf.delta, prior, time));
 
   const tagText = readItemsTagText(chat[index].mes); // null = 无块
@@ -950,95 +1185,69 @@ function parseShortRef(ref: string): number | null {
  */
 export function finalizeDelta(delta: SummaryDelta, openPlansOrdered: { id: string }[]): StoredDelta {
   const out: StoredDelta = {};
-  if (typeof delta.time === 'string' && delta.time.trim()) out.time = delta.time.trim();
-  if (typeof delta.location === 'string' && delta.location.trim()) out.location = delta.location.trim();
+  const time = optText(delta.time);
+  const location = optText(delta.location);
+  if (time) out.time = time;
+  if (location) out.location = location;
   // 权威定位路径:规范化后非空才固化(只有给了 location 才有意义,但不强制——手动场景可单独给)
-  const lp = normScenePath(delta.locationPath);
+  const lp = cleanPath(delta.locationPath);
   if (lp.length) out.locationPath = lp;
 
-  if (delta.items) {
+  if (isRecord(delta.items)) {
     const items: NonNullable<StoredDelta['items']> = {};
-    if (delta.items.add?.length) items.add = delta.items.add;
-    if (delta.items.update?.length) items.update = delta.items.update;
-    if (delta.items.remove?.length) items.remove = delta.items.remove;
+    const add = cleanItemList(delta.items.add);
+    const update = cleanItemList(delta.items.update);
+    const remove = cleanTextList(delta.items.remove, ['name', 'item', 'id']);
+    if (add.length) items.add = add;
+    if (update.length) items.update = update;
+    if (remove.length) items.remove = remove;
     if (Object.keys(items).length) out.items = items;
   }
 
-  if (delta.scenes) {
+  if (isRecord(delta.scenes)) {
     // 规范化路径;「desc 必填」:add/update 缺描述的条目丢弃(写不出描述=不值得记)。
-    const clean = (arr?: SceneDelta[]): SceneDelta[] =>
-      (arr ?? [])
-        .map(s => ({ path: normScenePath(s.path), desc: s.desc?.trim() || undefined }))
-        .filter(s => s.path.length && s.desc); // 无 path 或无 desc → 丢弃
-    const cleanReparent = (arr?: SceneReparent[]): SceneReparent[] =>
-      (arr ?? [])
-        .map(r => {
-          const node = normScenePath(r.node);
-          const newPath = normScenePath(r.newPath);
-          const descs: Record<string, string> = {};
-          for (const [k, v] of Object.entries(r.descs ?? {})) {
-            const key = String(k).trim();
-            const val = String(v ?? '').trim();
-            if (key && val) descs[key] = val;
-          }
-          return { node, newPath, descs };
-        })
-        .filter(r => r.node.length && r.newPath.length);
     const scenes: NonNullable<StoredDelta['scenes']> = {};
-    const add = clean(delta.scenes.add);
-    const update = clean(delta.scenes.update);
-    const reparent = cleanReparent(delta.scenes.reparent);
+    const add = cleanSceneList(delta.scenes.add);
+    const update = cleanSceneList(delta.scenes.update);
+    const reparent = cleanSceneReparentList(delta.scenes.reparent);
     if (add.length) scenes.add = add;
     if (update.length) scenes.update = update;
     if (reparent.length) scenes.reparent = reparent;
     if (Object.keys(scenes).length) out.scenes = scenes;
   }
 
-  if (delta.npcs) {
+  if (isRecord(delta.npcs)) {
     // 规范化:add/update 必须有名字才保留(无名 NPC 不记)
-    const clean = (arr?: NpcDelta[]): NpcDelta[] =>
-      (arr ?? [])
-        .map(n => ({
-          name: String(n.name ?? '').trim(),
-          gender: n.gender?.trim() || undefined,
-          title: n.title?.trim() || undefined,
-          desc: n.desc?.trim() || undefined,
-          personality: n.personality?.trim() || undefined,
-          outfit: n.outfit?.trim() || undefined,
-          condition: n.condition?.trim() || undefined,
-          important: typeof n.important === 'boolean' ? n.important : undefined,
-          follow: typeof n.follow === 'boolean' ? n.follow : undefined,
-          location: n.location?.trim() || undefined,
-        }))
-        .filter(n => n.name);
     const npcs: NonNullable<StoredDelta['npcs']> = {};
-    const add = clean(delta.npcs.add);
-    const update = clean(delta.npcs.update);
-    const remove = (delta.npcs.remove ?? []).map(s => String(s ?? '').trim()).filter(Boolean);
+    const add = cleanNpcList(delta.npcs.add);
+    const update = cleanNpcList(delta.npcs.update);
+    const remove = cleanTextList(delta.npcs.remove, ['name', 'npc', 'id']);
     if (add.length) npcs.add = add;
     if (update.length) npcs.update = update;
     if (remove.length) npcs.remove = remove;
     if (Object.keys(npcs).length) out.npcs = npcs;
   }
 
-  if (delta.plans) {
+  if (isRecord(delta.plans)) {
     const plans: NonNullable<StoredDelta['plans']> = {};
-    if (delta.plans.add?.length) plans.add = delta.plans.add;
-    if (delta.plans.resolve?.length) {
+    const add = cleanPlanAddList(delta.plans.add);
+    if (add.length) plans.add = add;
+    if (arr(delta.plans.resolve).length) {
       const out: PlanResolveItem[] = [];
-      for (const ref of delta.plans.resolve) {
+      for (const ref of arr(delta.plans.resolve)) {
         // 短序号可能是裸字符串 "p2" 或带结局的对象 { id:"p2", outcome, reason }
-        const shortRef = typeof ref === 'string' ? ref : ref.id;
+        const shortRef = namedText(ref, ['id', 'ref', 'planId']);
         const n = parseShortRef(shortRef);
         if (n === null) continue;
         const target = openPlansOrdered[n - 1];
         if (!target) continue;
-        if (typeof ref === 'string') {
+        if (!isRecord(ref)) {
           out.push(target.id); // 旧格式:只翻译成稳定 id
         } else {
           const entry: PlanResolveItem = { id: target.id };
           if (ref.outcome === 'done' || ref.outcome === 'cancelled' || ref.outcome === 'failed') entry.outcome = ref.outcome;
-          if (typeof ref.reason === 'string' && ref.reason.trim()) entry.reason = ref.reason.trim();
+          const reason = optText(ref.reason);
+          if (reason) entry.reason = reason;
           out.push(entry);
         }
       }
@@ -1047,7 +1256,7 @@ export function finalizeDelta(delta: SummaryDelta, openPlansOrdered: { id: strin
     if (Object.keys(plans).length) out.plans = plans;
   }
 
-  if (delta.vars?.length) {
+  if (Array.isArray(delta.vars) && delta.vars.length) {
     const ops = finalizeVarOps(delta.vars);
     if (ops.length) out.varOps = ops;
   }
@@ -1472,7 +1681,7 @@ export function editLeafFull(
  */
 function rewriteFloorTags(chat: STMessage[], index: number, delta: StoredDelta): void {
   const leaf = getLeaf(chat[index]);
-  const time = leaf?.timeEnd?.trim() || leaf?.timeStart?.trim() || '';
+  const time = optText(leaf?.timeEnd) || optText(leaf?.timeStart) || '';
   const priorItems = deriveMemory(chat, index).items;
   let mes = writeItemLogTag(chat[index].mes, fmtItemLogInline(itemChangesOf(delta, priorItems, time)));
   mes = writeVarLogTag(mes, fmtVarOpsInline(delta.varOps));

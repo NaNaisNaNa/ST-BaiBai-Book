@@ -41,6 +41,16 @@ export const derivedMeta = reactive<{ hasLeaf: boolean; leaves: LeafView[]; pend
   rev: 0,
 });
 
+function scalarText(v: unknown): string {
+  if (typeof v === 'string') return v.trim();
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v).trim();
+  return '';
+}
+
+function optText(v: unknown): string | undefined {
+  return scalarText(v) || undefined;
+}
+
 /** 重放 chat 得到 state/items/plans,原地写回;并刷新 derivedMeta */
 export function recomputeDerived(): void {
   const ctx = getContext();
@@ -71,11 +81,11 @@ export function recomputeDerived(): void {
       const valid = leafValid(m);
       leaves.push({
         id: leaf.id,
-        text: leaf.text,
-        timeStart: leaf.timeStart,
-        timeEnd: leaf.timeEnd,
-        timeLabel: leaf.timeLabel,
-        createdAt: leaf.createdAt,
+        text: scalarText(leaf.text),
+        timeStart: optText(leaf.timeStart),
+        timeEnd: optText(leaf.timeEnd),
+        timeLabel: optText(leaf.timeLabel),
+        createdAt: typeof leaf.createdAt === 'number' ? leaf.createdAt : Date.now(),
         msgIndex: i,
         active: m.is_system === true,
         stale: !valid,
@@ -253,9 +263,23 @@ function mergeStoredDelta(a: StoredDelta, b: StoredDelta): void {
 
 /* ============ 载入 / 保存 ============ */
 
+function cleanSummaryNode(s: MemSummary, idx: number): MemSummary {
+  return {
+    id: scalarText(s.id) || `sum_bad_${idx}_${Date.now().toString(36)}`,
+    text: scalarText(s.text),
+    level: typeof s.level === 'number' ? s.level : 1,
+    createdAt: typeof s.createdAt === 'number' ? s.createdAt : Date.now(),
+    auto: s.auto !== false,
+    timeStart: optText(s.timeStart),
+    timeEnd: optText(s.timeEnd),
+    timeLabel: optText(s.timeLabel),
+    childIds: Array.isArray(s.childIds) ? s.childIds.map(x => scalarText(x)).filter(Boolean) : [],
+  };
+}
+
 function assignForest(target: BaibaiMemory, summaries: MemSummary[], varTemplates: Record<VarTier, VarTemplate>) {
   target.version = MEMORY_VERSION;
-  target.summaries = summaries;
+  target.summaries = summaries.map(cleanSummaryNode);
   target.varTemplates = varTemplates;
 }
 
