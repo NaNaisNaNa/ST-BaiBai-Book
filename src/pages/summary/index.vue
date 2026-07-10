@@ -219,7 +219,7 @@ let resummaryHintTimer: ReturnType<typeof setTimeout> | null = null;
 // 总结节奏:实际约每「保留最近 AI 消息数 + 每次总结 AI 消息数」楼总结一次——
 // 最近 keepRecent 条发全文不摘,更早的摘成叶子,叶子攒够 leafBatchThreshold 条压一次总结。
 // 阈值关闭(<2)时不显示节奏句。
-const resummaryEvery = computed(() => (Math.max(0, apiSettings.keepRecent) + apiSettings.leafBatchThreshold) * 2);
+const resummaryEvery = computed(() => (Math.max(0, apiSettings.keepRecent) + apiSettings.leafBatchThreshold + apiSettings.leafKeepRecent) * 2);
 const showCadence = computed(() => apiSettings.leafBatchThreshold >= 2);
 
 async function doResummarize() {

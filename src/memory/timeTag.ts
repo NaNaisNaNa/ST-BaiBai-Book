@@ -71,6 +71,7 @@ export function latestStoryTime(chat: STMessage[] | null): string {
   if (!chat) return '';
   for (let i = chat.length - 1; i >= 0; i--) {
     const m = chat[i];
+    if (m?.extra?.bbs_omit) continue;
     if (typeof m?.mes !== 'string' || !m.mes) continue;
     // ① 正文标签优先
     const { start, end } = parseTimeRange(clampToTimeTags(m.mes));

@@ -275,6 +275,37 @@ function fetchUserPersona(): string {
   return ctx.substituteParams('{{persona}}').trim();
 }
 
+// 提示楼正文里的固定句,既给用户看,也用作旧数据兼容识别与末楼去重哨兵。
+const BACKLOG_NOTICE_SENTINEL = '本次生成已拦截';
+
+/** 是否柏宝书自己插入的积压提示楼。正文识别只用于兼容升级前尚未带专用标记的旧提示楼。 */
+function isBacklogNotice(m: STMessage | undefined): boolean {
+  if (!m || m.is_user) return false;
+  if (m.extra?.bbs_internal_notice === 'backlog') return true;
+  return m.name === '柏宝书' && typeof m.mes === 'string' && m.mes.includes(BACKLOG_NOTICE_SENTINEL);
+}
+
+/**
+ * 把积压提示楼标成内部楼层:
+ *  - bbs_internal_notice:明确身份,避免靠正文长期判断;
+ *  - bbs_omit:复用现有「彻底不参与记忆」通道,确保即便旧提示楼曾被误摘,其叶子也不再重放/注入。
+ * 返回是否改动过 chat,调用方据此重算与落盘。
+ */
+function normalizeBacklogNotices(chat: STMessage[]): boolean {
+  let changed = false;
+  for (const m of chat) {
+    if (!isBacklogNotice(m)) continue;
+    if (m.extra?.bbs_internal_notice === 'backlog' && m.extra?.bbs_omit === true) continue;
+    m.extra = { ...(m.extra ?? {}), bbs_internal_notice: 'backlog', bbs_omit: true };
+    changed = true;
+  }
+  if (changed) {
+    recomputeDerived();
+    scheduleLeafFlush();
+  }
+  return changed;
+}
+
 /**
  * 是否「可追踪的 AI 楼层」。与「是否对主 LLM 可见」解耦——隐藏与否都要算,只要它是真实的 AI 回复。
  *
@@ -299,6 +330,7 @@ export function isAiFloor(m: STMessage | undefined): boolean {
 export function isRealAiReply(m: STMessage | undefined): boolean {
   if (!m || m.is_user) return false;
   if (typeof m.mes !== 'string' || !m.mes.trim()) return false;
+  if (isBacklogNotice(m)) return false; // 插件内部提示楼不是剧情正文,不挂楼内面板、不参与记忆
   if (m.extra?.bbs_hidden) return true; // 被我们隐藏的旧 AI 楼
   // ST 原生系统楼带 extra.type(narrator/sys 等);真实回复(可见或被 /hide)无 type。
   if (m.is_system && m.extra?.type) return false;
@@ -354,9 +386,6 @@ export function holesExceptLast(chat: STMessage[]): number[] {
   return pendingAiFloors(chat).filter(i => i < lastAi);
 }
 
-// 提示楼正文里的固定句,既给用户看,也用作「末楼是否已是本提示楼」的去重哨兵
-const BACKLOG_NOTICE_SENTINEL = '本次生成已拦截';
-
 /**
  * 「开场白待摘」场景:最新 AI 楼是**全对话第一条 AI 楼(开场白)**、尚未摘要、且正文无时间标签。
  * 返回该开场白楼层索引;不匹配返回 -1。
@@ -386,9 +415,8 @@ export function openingPendingFloor(chat: STMessage[]): number {
  * 生成拦截器:每次「产出新正文」的生成前,守住不变式「除最后一条 AI 外其余都必须有摘要」。
  * 判据 = holesExceptLast(末尾 AI 之前的待摘楼层),按数量分流:
  *  - 0 个 → 放行。
- *  - 恰好 1 个 → 看那唯一的洞是否正在后台生成摘要(currentRun 非空):
- *      · 在飞 → toast 提示并 await 它结束(promise 永不 reject,不会卡死);完成后重判,洞填上则放行,否则拦截。
- *      · 不在飞 → 直接拦截(后台没在补它,等也没意义)。
+ *  - 恰好 1 个 → 等待正在后台生成的摘要;若事件时序未启动它,拦截器自行补这一楼。
+ *    完成后重判,洞填上则放行并确保最新稳定楼继续在后台追赶,否则拦截。
  *  - >1 个 → 直接拦截(不等待;多个洞交给后台 maybeSummarizePrevAi「最早优先」逐条补,用户补完再重发)。
  * 拦截 = abort(true) + /sendas 插提示楼。
  *
@@ -416,6 +444,7 @@ export async function handleGenerationIntercept(
   if (!ctx) return false;
   if (!ctx.getCurrentChatId?.()) return false; // 欢迎页:无聊天不拦
   const chat = ctx.chat ?? [];
+  normalizeBacklogNotices(chat); // 兼容升级前已存在但尚未标记的提示楼
 
   // 开场白特判(不拦,只等):开场白无时间标签、又还没摘时,先摘它建立时间锚点,再放行首次生成。
   // 否则主模型与开场白摘要会各自凭空编一个开场时间,导致正文与摘要时间对不上(用户实测)。
@@ -434,16 +463,28 @@ export async function handleGenerationIntercept(
   }
 
   let holes = holesExceptLast(chat);
-  if (holes.length < 1) return false; // 无洞:放行
+  if (holes.length < 1) {
+    // 正常发送时确保最新稳定 AI 楼已进入后台摘要;regenerate/swipe 则继续跳过正在改写的末楼。
+    // 通常事件监听器已经启动了它,busy 守卫会自动去重;这里是时序兜底。
+    void maybeSummarizePrevAi(type === 'regenerate' || type === 'swipe');
+    return false;
+  }
 
-  // 恰好 1 个洞,且它正在后台生成 → 等它,等完重判(成功放行 / 失败落到拦截)。
+  // 恰好 1 个洞:优先等后台任务;若事件时序未启动且引擎空闲,拦截器自行补。
   if (holes.length === 1) {
     const inflight = currentSummaryPromise();
     if (inflight) {
       toast('正在补摘前一楼层,请稍候…', 'info');
       await inflight;
-      holes = holesExceptLast(chat);
-      if (holes.length < 1) return false; // 补完,洞没了 → 放行
+    } else if (!busy) {
+      toast('正在补摘前一楼层,请稍候…', 'info');
+      await runSummary(holes[0]);
+    }
+    holes = holesExceptLast(chat);
+    if (holes.length < 1) {
+      // 填洞后立即续上最新稳定楼的后台摘要,恢复「摘要与正文生成并行」的正常节奏。
+      void maybeSummarizePrevAi(type === 'regenerate' || type === 'swipe');
+      return false;
     }
   }
 
@@ -467,6 +508,9 @@ export async function handleGenerationIntercept(
     ].join('{{newline}}');
     try {
       await exec(`/sendas name="柏宝书" ${text}`);
+      // /sendas 产物在 ST 中是普通非用户消息(is_system=false、无 extra.type),必须主动标记,
+      // 否则它会被下一轮当成真实 AI 楼再次要求补摘。
+      normalizeBacklogNotices(chat);
     } catch (e) {
       engineState.lastError = `积压提示楼插入失败: ${e instanceof Error ? e.message : String(e)}`;
     }
@@ -568,14 +612,16 @@ export async function setFloorOmit(floor: number, on: boolean): Promise<void> {
 }
 
 /**
- * 自动触发的单楼增量摘要:**最早待摘优先**,一次只摘一条。
+ * 自动触发的顺序追赶摘要:**最早待摘优先**,在本次可摘范围内串行补到没有缺口。
  * @param skipLastAi true 时跳过正在操作的末尾 AI 消息(翻页/重新生成场景),它不参与目标选取。
  *
  * 不变式:除最后一条 AI 外,其余 AI 楼都应有摘要。为此目标取「可摘范围内最早的待摘 AI 楼」,
  * 而非「上一条」——否则前面有失败楼(洞)时,新楼会越过它先摘,导致倒序(计划漏删等)。
  *  - 发消息:可摘范围 = 直到最后一条 AI 楼。skipLastAi=false。
  *  - 翻页/重新生成:末尾 AI 正在被改写,排除它,范围 = 直到之前那条 AI。skipLastAi=true。
- * 配合生成拦截(有洞且未补完前不放行),每轮补一条也不会让洞越积越多。
+ * 追赶为何要循环:若 A/B 两楼都待摘,生成拦截只需等待 A 填洞后即可放行;本函数会随即继续
+ * 在后台补 B,恢复「最新一楼摘要与正文生成并行」的正常节奏,避免永久落后一楼。
+ * 任一楼失败或未产生有效叶子立即停止,防止死循环;下次触发再重试。
  */
 export async function maybeSummarizePrevAi(skipLastAi: boolean): Promise<void> {
   if (!engineActiveHere()) return;
@@ -589,13 +635,18 @@ export async function maybeSummarizePrevAi(skipLastAi: boolean): Promise<void> {
   // 可摘范围上界:发消息=最后一条 AI;翻页/重生=之前那条 AI(末尾易变,排除)。
   const ceiling = prevAiFloor(chat, skipLastAi);
   if (ceiling < 0) return;
-  // 范围内最早的待摘 AI 楼(洞优先);没有则仅跑收尾(隐藏窗口可能变化)。
-  const target = pendingAiFloors(chat).find(f => f <= ceiling);
-  if (target === undefined) {
-    await afterSummaryHideAndInject(chat);
-    return;
+
+  while (true) {
+    // 范围内最早的待摘 AI 楼(洞优先)。ceiling 固定为触发时的已定稿边界,
+    // 即使放行后又生成了新楼,也不会把新楼误并进本轮追赶。
+    const target = pendingAiFloors(chat).find(f => f <= ceiling);
+    if (target === undefined) break;
+    await runSummary(target);
+    if (!leafValid(chat[target])) {
+      console.log('[柏宝书] 顺序追赶停止:楼层未成功落叶', target);
+      break;
+    }
   }
-  await runSummary(target);
   await afterSummaryHideAndInject(chat);
 }
 
@@ -1566,9 +1617,10 @@ export function bindEngine(): void {
   const es = ctx.eventSource;
   const et = ctx.eventTypes;
 
+  normalizeBacklogNotices(ctx.chat ?? []);
   console.log('[柏宝书] bindEngine 执行,监听', et.USER_MESSAGE_RENDERED, et.GENERATION_STARTED);
 
-  // 发新消息:此刻末尾 AI 是「上一条已定稿」的回复,摘它。
+  // 发新消息:此刻末尾 AI 是「上一条已定稿」的回复,从最早缺口开始顺序追赶到它。
   es.on(et.USER_MESSAGE_RENDERED, () => {
     console.log('[柏宝书] USER_MESSAGE_RENDERED → 摘上一条 AI');
     void maybeSummarizePrevAi(false);
@@ -1610,7 +1662,10 @@ export function bindEngine(): void {
     es.on(et.CHAT_CHANGED, () => {
       // 记忆重载由 store 的 CHAT_CHANGED 监听负责;此处仅在其后刷新注入
       clearRecallInjection(); // 切聊天先抹掉上个聊天的召回残留(新聊天下次生成再重算)
-      setTimeout(() => refreshInjection(), 0);
+      setTimeout(() => {
+        normalizeBacklogNotices(getContext()?.chat ?? []);
+        refreshInjection();
+      }, 0);
     });
   }
 

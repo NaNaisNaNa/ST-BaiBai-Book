@@ -73,6 +73,7 @@ function buildStateSnapshot(chat: STMessage[], upTo: number): string {
  */
 function findSnapshotCut(chat: STMessage[], windowStart: number): number {
   for (let i = windowStart; i < chat.length; i++) {
+    if (chat[i]?.extra?.bbs_omit) continue;
     if (!leafValid(chat[i])) return i;
   }
   return chat.length;
@@ -108,6 +109,7 @@ function buildMessages(chat: STMessage[]): ChatMsg[] {
   for (let i = windowStart; i < chat.length; i++) {
     const m = chat[i];
     if (!m) continue;
+    if (m.extra?.bbs_omit) continue;
     if (m.is_system && m.extra?.type) continue; // 原生系统楼跳过
     const text = cleanFloor(m);
     if (!text) continue;

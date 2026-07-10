@@ -75,6 +75,7 @@ function collectLeaves(chat: STMessage[]): LeafForIndex[] {
   const seeds = seedLeafIds();
   const out: LeafForIndex[] = [];
   for (let i = 0; i < chat.length; i++) {
+    if (chat[i]?.extra?.bbs_omit) continue;
     if (!leafValid(chat[i])) continue;
     const leaf = getLeaf(chat[i]) as LeafExtra;
     if (leaf.seed || seeds.has(leaf.id)) continue; // 种子叶子:承载整段总结,不进向量库(见 LeafExtra.seed)

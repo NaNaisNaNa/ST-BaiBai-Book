@@ -64,6 +64,7 @@ function windowLeafIds(chat: STMessage[]): string[] {
   const keepStart = resolveKeepStart(chat);
   const ids: string[] = [];
   for (let i = keepStart; i < chat.length; i++) {
+    if (chat[i]?.extra?.bbs_omit) continue;
     if (leafValid(chat[i])) ids.push(getLeaf(chat[i])!.id);
   }
   return ids;
@@ -176,7 +177,7 @@ function buildRecallCacheKey(chat: STMessage[], cfg: typeof apiSettings.vector.r
   const userText = chat[userIdx]?.mes ?? '';
   let aiText = '';
   for (let i = userIdx - 1; i >= 0; i--) {
-    if (!chat[i]?.is_user) {
+    if (isAiFloor(chat[i])) {
       aiText = chat[i]?.mes ?? '';
       break;
     }

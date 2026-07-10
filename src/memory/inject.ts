@@ -59,6 +59,7 @@ function leafActiveAt(chat: STMessage[] | null, i: number): boolean {
 /** 用于决定状态快照相对最新 AI 楼的位置;与 engine.ts 的可追踪 AI 楼规则保持一致。 */
 function isTrackableAiMessage(m: STMessage | undefined): boolean {
   if (!m || m.is_user) return false;
+  if (m.extra?.bbs_omit) return false;
   if (typeof m.mes !== 'string' || !m.mes.trim()) return false;
   if (m.extra?.bbs_hidden) return true;
   return !m.is_system;
@@ -174,7 +175,11 @@ function nodeTime(n: ViewNode): string {
   return n.timeLabel ? compactTimeLabel(n.timeLabel) : '';
 }
 
-/** 把选出的节点拼成历史摘要文本块(带时间标签前缀);空则返回空串 */
+/**
+ * 把选出的节点拼成只带绝对时间的历史摘要文本块;空则返回空串。
+ * 这套渲染器供摘要/批量摘要/查询重写等副任务复用:它们各自有历史截止点,
+ * 不能沿用主对话「相对当前最新剧情」的口径,因此这里刻意不计算相对时间。
+ */
 export function renderHistoryNodes(nodes: ViewNode[]): string {
   return nodes
     .map(n => {
@@ -191,22 +196,55 @@ function nodeEventTime(n: ViewNode): string {
   return n.timeLabel ? splitTimeLabel(n.timeLabel).end ?? '' : '';
 }
 
+/** 取节点未压缩的起止时间;新字段优先,缺失端再从旧 timeLabel 回退。 */
+function nodeTimeRange(n: ViewNode): { start: string; end: string } {
+  const legacy = n.timeLabel ? splitTimeLabel(n.timeLabel) : {};
+  return {
+    start: n.timeStart?.trim() || legacy.start?.trim() || '',
+    end: n.timeEnd?.trim() || legacy.end?.trim() || '',
+  };
+}
+
+/** 给一个完整时间点追加相对时间与周几;无法推断的部分自然省略。 */
+function timePointWithRelative(time: string, now: string): string {
+  const value = time.trim();
+  if (!value) return '';
+  const parts = [relativeTimeLabel(value, now), weekdayLabel(value)].filter(Boolean);
+  return parts.length ? `${value}(${parts.join('·')})` : value;
+}
+
 /**
- * 注入专用:在绝对时间前再加一个相对前缀(如【(昨天) 1988/9/29 21:30】),帮主模型感知时间距离。
+ * 总结节点跨越一段时间,不能用单个「昨天」代表整段。
+ * 因此起点、终点分别相对同一个 now 计算,并保留两端完整绝对时间:
+ * 【1988/9/28 22:00(前天·周三) - 1988/9/29 08:00(昨天·周四)】
+ */
+function nodeRangeWithRelative(n: ViewNode, now: string): string {
+  const { start, end } = nodeTimeRange(n);
+  if (!start && !end) return '';
+  if (start && end && start !== end) {
+    return `${timePointWithRelative(start, now)} - ${timePointWithRelative(end, now)}`;
+  }
+  return timePointWithRelative(start || end, now);
+}
+
+/**
+ * 主对话注入专用:为历史节点补相对时间,帮主模型感知剧情距离。
  * 参照点 now = 故事内最新时间;无法解析相对差的(架空纪年等)降级为只显示绝对时间。
- * 不并入 renderHistoryNodes —— 那个被摘要模型上下文复用,不能带相对前缀(会污染且参照点不同)。
+ * 不并入 renderHistoryNodes —— 后者被摘要模型等副任务复用,截止点和参照点不同。
  *
- * ⚠️ 仅**叶子**(未压缩的单楼摘要)加相对前缀:它指向某一刻、相对距离有意义。
- * 压缩节点(总结)跨多楼、本身就是一段时间范围,标个「(昨天)」反而误导主模型、易出错 —— 只给绝对时间。
- *
- * 周几与相对时间并入同一个括号(相对·周三);仅标准公历带年份才有周几(weekdayLabel 自带门槛)。
+ * 叶子摘要指向单楼,维持【(昨天·周三) 绝对时间】格式。
+ * 总结跨多楼,按起止端分别标注为【起始(相对) - 结束(相对)】,避免用单个相对时间误代表整段。
+ * 周几与相对时间并入同一个括号;仅标准公历带年份才有周几(weekdayLabel 自带门槛)。
  */
 function renderHistoryNodesWithRelative(nodes: ViewNode[], now: string): string {
   return nodes
     .map(n => {
+      if (n.kind === 'comp') {
+        const range = nodeRangeWithRelative(n, now);
+        return range ? `【${range}】${n.text}` : n.text;
+      }
       const t = nodeTime(n);
       if (!t) return n.text;
-      if (n.kind !== 'leaf') return `【${t}】${n.text}`;
       const event = nodeEventTime(n);
       const parts = [relativeTimeLabel(event, now), weekdayLabel(event)].filter(Boolean);
       return parts.length ? `【(${parts.join('·')}) ${t}】${n.text}` : `【${t}】${n.text}`;
