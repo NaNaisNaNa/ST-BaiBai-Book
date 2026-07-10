@@ -3,7 +3,7 @@
  * 楼内摘要面板(挂在每条 AI 楼的 shadow 内,由 floorPanel.ts 逐楼挂载)。
  *
  * 形态:一张与摘要页同源的卡片(.bbs-summary-card 语言)。
- *   - 卡片头(锚点):严格单行 —— 楼号 + 摘要预览 + 番外键 + 展开箭头。
+ *   - 卡片头(锚点):严格单行 —— 楼号 + 摘要预览 + 番外键 + 单楼摘要键。
  *   - 卡片体(抽屉):grid 0fr↔1fr 高度过渡(同 SummaryNode.vue,内容常驻不脱流,无闪烁)。
  *     变动按类型分组、以「标签流」横向排列。
  *
@@ -16,9 +16,11 @@
  */
 import { computed, nextTick, reactive, ref, watch } from 'vue';
 import Icon from '@/components/Icon.vue';
+import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import { getContext, type STMessage } from '@/st/context';
+import { toast } from '@/st/toast';
 import { getLeaf, leafValid, deleteLeafAt, editLeafFull, planContentById, describeVarOp } from '@/memory/apply';
-import { setFloorOmit } from '@/memory/engine';
+import { engineState, floorBackfillState, regenerateFloor, setFloorOmit, summarizeFloor } from '@/memory/engine';
 import { derivedMeta } from '@/memory/store';
 import { ui } from '@/state/ui';
 import type { LeafExtra, StoredDelta, ItemDelta, NpcDelta, VarOp, JsonValue } from '@/memory/types';
@@ -57,6 +59,22 @@ const d = computed<StoredDelta | null>(() => leaf.value?.delta ?? null);
 
 const expanded = ref(false);
 const busy = ref(false);
+const regenerateConfirmOpen = ref(false);
+
+const summarizingHere = computed(() => {
+  void props.sig.tick;
+  void derivedMeta.rev;
+  const chatId = getContext()?.getCurrentChatId?.() ?? '';
+  return floorBackfillState.running
+    && floorBackfillState.floor === props.floor
+    && floorBackfillState.chatId === chatId;
+});
+const summaryActionDisabled = computed(() => busy.value || engineState.running || omit.value);
+const summaryActionTitle = computed(() => {
+  if (omit.value) return '番外楼不参与摘要,请先取消番外';
+  if (summarizingHere.value) return `正在生成楼层 #${props.floor} 的摘要`;
+  return valid.value ? `重新生成楼层 #${props.floor} 的摘要` : `生成楼层 #${props.floor} 的摘要`;
+});
 
 const previewText = computed(() => {
   if (omit.value) return '不计入记忆';
@@ -544,18 +562,51 @@ async function removeLeaf() {
     busy.value = false;
   }
 }
-// 收起抽屉 / 切换番外时,复位删除确认态,避免下次展开还停在确认中
+// 收起抽屉 / 切换番外时,复位删除确认态;摘要失效时关闭重摘确认。
 watch([expanded, omit, leaf], () => {
   if (!expanded.value || omit.value || !leaf.value) confirmingDelete.value = false;
+  if (omit.value || !valid.value) regenerateConfirmOpen.value = false;
 });
 async function toggleOmit() {
-  if (busy.value) return;
+  if (busy.value || engineState.running) return;
   busy.value = true;
   try {
     await setFloorOmit(props.floor, !omit.value);
   } finally {
     busy.value = false;
   }
+}
+
+function requestSummary() {
+  if (summaryActionDisabled.value) return;
+  if (valid.value && leaf.value) {
+    regenerateConfirmOpen.value = true;
+    return;
+  }
+  void generateMissingSummary();
+}
+
+async function generateMissingSummary() {
+  if (summaryActionDisabled.value) return;
+  await summarizeFloor(props.floor);
+  if (engineState.lastError) {
+    toast(engineState.lastError, 'error');
+    return;
+  }
+  if (leafValid(getContext()?.chat?.[props.floor])) {
+    toast(`楼层 #${props.floor} 摘要已生成`, 'success');
+  }
+}
+
+async function confirmRegenerate() {
+  if (summaryActionDisabled.value) return;
+  const ok = await regenerateFloor(props.floor);
+  regenerateConfirmOpen.value = false;
+  if (ok) {
+    toast(`楼层 #${props.floor} 摘要已重新生成`, 'success');
+    return;
+  }
+  toast(engineState.lastError || `楼层 #${props.floor} 重新摘要失败`, 'error');
 }
 
 // 分组渲染表(模板里循环用,减少重复)。icon 复用导航同款描边图标,给每个类目一个可辨识的视觉锚点。
@@ -586,12 +637,22 @@ const groups = computed(() => [
           :class="{ 'is-active': omit }"
           type="button"
           :title="omit ? '取消番外(恢复参与记忆)' : '标为番外(此楼不参与摘要/总结/注入)'"
-          :disabled="busy"
+          :disabled="busy || engineState.running"
           @click.stop="toggleOmit"
         >
           <Icon name="sparkles" />
         </button>
-        <Icon name="chevron" class="bbs-fp-caret" :class="{ 'is-collapsed': !expanded }" />
+        <button
+          class="bbs-fp-summarybtn"
+          type="button"
+          :title="summaryActionTitle"
+          :aria-label="summaryActionTitle"
+          :disabled="summaryActionDisabled"
+          @click.stop="requestSummary"
+        >
+          <span v-if="summarizingHere" class="bbs-fp-spinner"></span>
+          <Icon v-else name="search" />
+        </button>
       </header>
 
       <!-- 卡片体 = 抽屉(grid 高度过渡) -->
@@ -777,6 +838,19 @@ const groups = computed(() => [
         </div>
       </div>
     </article>
+
+    <ConfirmDialog
+      v-model:open="regenerateConfirmOpen"
+      :title="`重新摘要楼层 #${floor}`"
+      confirmText="重新生成"
+      confirmIcon="search"
+      :busy="summarizingHere"
+      busyText="生成中…"
+      @confirm="confirmRegenerate"
+    >
+      当前摘要将被新结果替换,该楼带来的时间、物品、角色、计划等记忆会重新计算。
+      如果该楼已被上层总结收纳,包含它的上层总结将失效并被移除。继续?
+    </ConfirmDialog>
   </div>
 </template>
 
@@ -800,7 +874,7 @@ const groups = computed(() => [
   border-left: 3px solid var(--bbs-ink-muted);
 }
 
-/* 卡片头:左侧两行主区(楼号+时间 / 预览)+ 右侧番外键、箭头 */
+/* 卡片头:左侧两行主区(楼号+时间 / 预览)+ 右侧番外键、单楼摘要键 */
 .bbs-fp-head {
   display: flex;
   align-items: center;
@@ -868,7 +942,8 @@ const groups = computed(() => [
   color: var(--bbs-ink-muted);
   font-style: italic;
 }
-.bbs-fp-omitbtn {
+.bbs-fp-omitbtn,
+.bbs-fp-summarybtn {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
@@ -886,22 +961,31 @@ const groups = computed(() => [
     color var(--bbs-dur) var(--bbs-ease),
     background var(--bbs-dur) var(--bbs-ease);
 }
-.bbs-fp-omitbtn:hover {
+.bbs-fp-omitbtn:hover:not(:disabled),
+.bbs-fp-summarybtn:hover:not(:disabled) {
   color: var(--bbs-accent);
   background: var(--bbs-surface-2);
+}
+.bbs-fp-omitbtn:disabled,
+.bbs-fp-summarybtn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 .bbs-fp-omitbtn.is-active {
   color: var(--bbs-accent);
   background: var(--bbs-accent-soft);
 }
-.bbs-fp-caret {
-  flex: 0 0 auto;
-  color: var(--bbs-ink-muted);
-  font-size: 13px;
-  transition: transform var(--bbs-dur) var(--bbs-ease);
+.bbs-fp-spinner {
+  width: 13px;
+  height: 13px;
+  box-sizing: border-box;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: bbs-fp-spin 0.7s linear infinite;
 }
-.bbs-fp-caret.is-collapsed {
-  transform: rotate(-90deg);
+@keyframes bbs-fp-spin {
+  to { transform: rotate(360deg); }
 }
 .bbs-fp-card.is-expanded .bbs-fp-head {
   margin-bottom: 12px;
@@ -1311,9 +1395,11 @@ const groups = computed(() => [
 
 @media (prefers-reduced-motion: reduce) {
   .bbs-fp-drawer,
-  .bbs-fp-drawer-body,
-  .bbs-fp-caret {
+  .bbs-fp-drawer-body {
     transition: none;
+  }
+  .bbs-fp-spinner {
+    animation-duration: 1.4s;
   }
 }
 </style>

@@ -1906,6 +1906,34 @@ export function deleteSummary(id: string): boolean {
 }
 
 /**
+ * 删除递归包含某个子节点的全部祖先压缩节点。
+ *
+ * 叶子重新生成时会保留原 id,因此 pruneBrokenComps 无法识别上层总结文本已经过时。
+ * 这里从 childId 向上找父节点并移除整条祖先链;未被任何总结收纳的叶子不会造成改动。
+ */
+export function invalidateSummaryAncestors(childId: string): number {
+  if (!childId) return 0;
+  const affected = new Set<string>([childId]);
+  let found = true;
+  while (found) {
+    found = false;
+    for (const summary of memory.summaries) {
+      if (affected.has(summary.id)) continue;
+      if (summary.childIds.some(id => affected.has(id))) {
+        affected.add(summary.id);
+        found = true;
+      }
+    }
+  }
+
+  const before = memory.summaries.length;
+  memory.summaries = memory.summaries.filter(summary => !affected.has(summary.id));
+  const removed = before - memory.summaries.length;
+  if (removed > 0) saveMemory();
+  return removed;
+}
+
+/**
  * 祖先链整删:某叶子 id 不再有效(被删/陈旧/换新 id)时,凡是(递归)包含它的压缩节点全删。
  * 判定:一个压缩节点「完好」⟺ 它的每个 child 要么是现存有效叶子 id、要么是完好的压缩节点;
  * 否则「损坏」,删除。memoized DFS。删除后 saveMemory(若有变化)。

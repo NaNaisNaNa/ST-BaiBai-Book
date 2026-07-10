@@ -5,7 +5,7 @@ import type { TaskType } from '@/api/settings';
 import type { STMessage, WorldInfoEntry } from '@/st/context';
 import { getContext, getCheckWorldInfo, getEjsTemplate, setMessageText } from '@/st/context';
 import { toast } from '@/st/toast';
-import { addSummary, deriveMemory, finalizeDelta, fmtVarOpsInline, getLeaf, itemChangesOf, leafValid, makeLeafId, pruneBrokenComps, syncItemLogFromMessage } from './apply';
+import { addSummary, deriveMemory, finalizeDelta, fmtVarOpsInline, getLeaf, invalidateSummaryAncestors, itemChangesOf, leafValid, makeLeafId, pruneBrokenComps, syncItemLogFromMessage } from './apply';
 import { extractJsonObject } from './json';
 import { clearInjection, refreshInjection, renderHistoryNodes, selectHistoryNodesBefore } from './inject';
 import { buildBatchSummaryPrompt, buildBatchThinking, buildCharCardSystem, buildPersonaSystem, buildResummaryPrompt, buildSummaryPrompt, buildWorldInfoSystem, fmtItemLogInline, JAILBREAK_PROMPT, selectRecentResolvedPlans, THINKING_CHECKLIST, THINKING_PREFILL } from './prompts';
@@ -38,7 +38,7 @@ export const engineState = reactive({
 });
 
 /**
- * 手动单楼补摘状态(模块级单例,供 UI 跨「关窗重开」恢复对应楼层的转圈)。
+ * 手动单楼摘要状态(补摘/重摘共用;模块级单例,供 UI 跨「关窗重开」恢复对应楼层的转圈)。
  * chatId 用于隔离聊天:切到别的聊天时不把相同楼层号误显示为正在补摘。
  */
 export const floorBackfillState = reactive({
@@ -600,6 +600,42 @@ export async function summarizeFloor(floor: number): Promise<void> {
 }
 
 /**
+ * 手动重新生成某楼现有摘要。
+ * 旧叶子保留到新请求成功后才替换;失败时原摘要与派生状态不变。
+ * 重摘保留叶子 id,避免后续计划引用失效;包含该叶子的上层总结会在落叶时失效移除。
+ * 此操作只重做当前叶子,不额外触发上层总结请求。
+ */
+export async function regenerateFloor(floor: number): Promise<boolean> {
+  if (!engineActiveHere()) return false;
+  if (busy) return false;
+  const ctx = getContext();
+  if (!ctx) return false;
+  const chat = ctx.chat ?? [];
+  if (!isAiFloor(chat[floor]) || !leafValid(chat[floor])) return false;
+  const oldLeaf = getLeaf(chat[floor]);
+  if (!oldLeaf) return false;
+
+  const chatId = ctx.getCurrentChatId?.() ?? '';
+  floorBackfillState.running = true;
+  floorBackfillState.floor = floor;
+  floorBackfillState.chatId = chatId;
+  try {
+    await runSummary(floor, { replaceLeaf: oldLeaf, checkResummary: false });
+    return getLeaf(chat[floor]) !== oldLeaf && !engineState.lastError;
+  } finally {
+    try {
+      await afterSummaryHideAndInject(chat);
+    } finally {
+      if (floorBackfillState.chatId === chatId && floorBackfillState.floor === floor) {
+        floorBackfillState.running = false;
+        floorBackfillState.floor = null;
+        floorBackfillState.chatId = '';
+      }
+    }
+  }
+}
+
+/**
  * 标记 / 取消标记某楼为「番外」(小剧场/番外篇,与主线剧情无关)。
  * 番外楼对引擎**彻底不存在**:不摘、不总结、不重放派生、不注入——由 isAiFloor 等处的 bbs_omit 守卫实现。
  *
@@ -855,8 +891,13 @@ async function sendAndParse<T>(
  *  - 真正的请求/落盘在 runSummaryInner;它内部已 try/catch,promise 永不 reject → 拦截器 await 不会卡死。
  * 注:早退(busy/非 AI 楼等)也会经历「置 p → 立即 finally 清回 null」,只是 p 几乎瞬间 resolve,不构成有效在飞。
  */
-export function runSummary(aiFloor: number): Promise<void> {
-  const p = runSummaryInner(aiFloor).finally(() => {
+interface RunSummaryOptions {
+  replaceLeaf?: LeafExtra;
+  checkResummary?: boolean;
+}
+
+export function runSummary(aiFloor: number, options: RunSummaryOptions = {}): Promise<void> {
+  const p = runSummaryInner(aiFloor, options).finally(() => {
     if (currentRun === p) currentRun = null;
   });
   currentRun = p;
@@ -878,6 +919,11 @@ function floorTargets(chat: STMessage[], aiFloor: number, covered: Set<number>):
   return targets;
 }
 
+/** 重摘已有叶子时只看目标楼之前的覆盖状态,避免旧叶子挡掉自己的前置用户消息。 */
+function coveredBeforeFloor(chat: STMessage[], floor: number): Set<number> {
+  return coveredSet(chat.slice(0, Math.max(0, floor)));
+}
+
 /**
  * 把一份 AI delta 固化成叶子并落到某 AI 楼(单楼与批量共用,保证两路径落叶口径一致)。
  *  - 时间:优先读该楼正文 <bbs_start>/<bbs_end> 标签(权威锚点);缺的那端用 AI 补的兜底。
@@ -890,9 +936,13 @@ function applyLeafForFloor(
   aiFloor: number,
   delta: SummaryDelta,
   stateBefore: ReturnType<typeof deriveMemory>,
+  replaceLeaf?: LeafExtra,
 ): void {
   if (!chat[aiFloor]) {
     throw new Error(`摘要落叶失败:楼层 #${aiFloor} 已不存在(可能在请求期间被删除)`);
+  }
+  if (replaceLeaf && getLeaf(chat[aiFloor]) !== replaceLeaf) {
+    throw new Error(`重新摘要失败:楼层 #${aiFloor} 的原摘要已在请求期间发生变化`);
   }
   // 时间锚点:从该楼正文标签读起止(先裁剪到正文段,跳过思维链/状态栏里混入的同名标签)
   const tag = parseTimeRange(clampToTimeTags(chat[aiFloor].mes));
@@ -908,16 +958,17 @@ function applyLeafForFloor(
   if (timeEnd) storedDelta.time = timeEnd;
 
   const leaf: LeafExtra = {
-    id: makeLeafId(),
+    id: replaceLeaf?.id ?? makeLeafId(),
     text: llmString(delta.summary),
     delta: storedDelta,
     timeStart,
     timeEnd,
-    createdAt: Date.now(),
+    createdAt: replaceLeaf?.createdAt ?? Date.now(),
     // 记录生成时所在页码,供 leafValid 判定归属(翻到别页时不串扰);缺 swipe_id 按第一页 0
-    swipe: typeof chat[aiFloor].swipe_id === 'number' ? chat[aiFloor].swipe_id : 0,
+    swipe: replaceLeaf?.swipe ?? (typeof chat[aiFloor].swipe_id === 'number' ? chat[aiFloor].swipe_id : 0),
     v: 1,
   };
+  if (replaceLeaf) invalidateSummaryAncestors(replaceLeaf.id);
   chat[aiFloor].extra = { ...(chat[aiFloor].extra ?? {}), bbs_leaf: leaf };
 
   // 把本楼物品净变动写进正文 </bbs_end> 之后(<bbs_items> 旁注,正则隐藏、不进副API摘要)。
@@ -939,6 +990,7 @@ async function summarizeFloorWork(
   chat: STMessage[],
   aiFloor: number,
   sender: { send: (messages: ChatMsg[]) => Promise<string>; label: string },
+  replaceLeaf?: LeafExtra,
 ): Promise<void> {
   const ctx = getContext();
   if (!ctx) throw new Error('无 ST 上下文');
@@ -946,7 +998,7 @@ async function summarizeFloorWork(
     throw new Error(`摘要失败:楼层 #${aiFloor} 已不存在(可能在请求期间被删除)`);
   }
 
-  const covered = coveredSet(chat);
+  const covered = replaceLeaf ? coveredBeforeFloor(chat, aiFloor) : coveredSet(chat);
   const targets = floorTargets(chat, aiFloor, covered);
   const content = renderMessages(chat, targets, ctx.name1, ctx.name2);
 
@@ -1007,7 +1059,7 @@ async function summarizeFloorWork(
     return { ...d, summary } as SummaryDelta & { summary: string };
   });
 
-  applyLeafForFloor(chat, aiFloor, delta, stateBefore);
+  applyLeafForFloor(chat, aiFloor, delta, stateBefore, replaceLeaf);
   engineState.lastRunAt = Date.now();
 
   // 立刻反映到派生与注入;落盘走防抖(隐藏由收尾的 syncWindowHiddenState 统一负责)
@@ -1017,7 +1069,7 @@ async function summarizeFloorWork(
   scheduleVectorIndex(); // 新叶子 → 防抖同步进向量库(失败静默,不影响摘要)
 }
 
-async function runSummaryInner(aiFloor: number): Promise<void> {
+async function runSummaryInner(aiFloor: number, options: RunSummaryOptions = {}): Promise<void> {
   console.log('[柏宝书] runSummary 楼层', aiFloor, '| busy =', busy);
   if (!engineActiveHere()) { console.log('[柏宝书] runSummary 早退:插件总开关关闭或当前角色被排除'); return; }
   if (busy) { console.log('[柏宝书] runSummary 早退:busy'); return; }
@@ -1031,15 +1083,19 @@ async function runSummaryInner(aiFloor: number): Promise<void> {
   if (!ctx) return;
   const chat = ctx.chat ?? [];
   if (!isAiFloor(chat[aiFloor])) { console.log('[柏宝书] runSummary 早退:非 AI 楼', aiFloor); return; }
+  if (options.replaceLeaf && getLeaf(chat[aiFloor]) !== options.replaceLeaf) {
+    engineState.lastError = `重新摘要失败:楼层 #${aiFloor} 的原摘要已发生变化`;
+    return;
+  }
   console.log('[柏宝书] runSummary 即将发请求,', sender.label);
 
   busy = true;
   engineState.running = true;
   engineState.lastError = '';
   try {
-    await summarizeFloorWork(chat, aiFloor, sender);
+    await summarizeFloorWork(chat, aiFloor, sender, options.replaceLeaf);
     // 摘要积累到阈值则触发总结
-    await checkResummary();
+    if (options.checkResummary !== false) await checkResummary();
   } catch (e) {
     engineState.lastError = e instanceof Error ? e.message : String(e);
   } finally {
