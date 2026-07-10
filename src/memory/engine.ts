@@ -38,6 +38,16 @@ export const engineState = reactive({
 });
 
 /**
+ * 手动单楼补摘状态(模块级单例,供 UI 跨「关窗重开」恢复对应楼层的转圈)。
+ * chatId 用于隔离聊天:切到别的聊天时不把相同楼层号误显示为正在补摘。
+ */
+export const floorBackfillState = reactive({
+  running: false,
+  floor: null as number | null,
+  chatId: '',
+});
+
+/**
  * 批量补摘运行状态(模块级单例,供 UI 跨「关窗重开」恢复进度/取消按钮)。
  * 放这里而非组件本地 ref:柏宝书窗口关闭会销毁组件、丢失本地 ref,但 batchBackfill 在本模块继续跑——
  * 关窗 ≠ 取消。重开后组件读这个单例即可恢复「补摘中 X/Y + 取消」的显示。
@@ -572,8 +582,21 @@ export async function summarizeFloor(floor: number): Promise<void> {
   if (!ctx) return;
   const chat = ctx.chat ?? [];
   if (!isAiFloor(chat[floor]) || leafValid(chat[floor])) return;
-  await runSummary(floor);
-  await afterSummaryHideAndInject(chat);
+  const chatId = ctx.getCurrentChatId?.() ?? '';
+  floorBackfillState.running = true;
+  floorBackfillState.floor = floor;
+  floorBackfillState.chatId = chatId;
+  try {
+    await runSummary(floor);
+    await afterSummaryHideAndInject(chat);
+  } finally {
+    // 只清理由本次调用写入的状态,避免未来支持队列后旧任务误清新任务。
+    if (floorBackfillState.chatId === chatId && floorBackfillState.floor === floor) {
+      floorBackfillState.running = false;
+      floorBackfillState.floor = null;
+      floorBackfillState.chatId = '';
+    }
+  }
 }
 
 /**

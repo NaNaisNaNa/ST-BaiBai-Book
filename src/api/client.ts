@@ -10,6 +10,7 @@ import type { ApiChannel } from './settings';
  */
 
 const GENERATE_URL = '/api/backends/chat-completions/generate';
+const DEFAULT_TIMEOUT_SEC = 180;
 
 export interface ChatMsg {
   role: 'system' | 'user' | 'assistant';
@@ -32,6 +33,44 @@ function normalizeUrl(url: string): string {
 
 export interface RequestOptions {
   signal?: AbortSignal;
+}
+
+function validTimeoutSec(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : DEFAULT_TIMEOUT_SEC;
+}
+
+/**
+ * 给完整请求生命周期套超时:不仅覆盖 fetch 建连,也覆盖非流式 JSON 读取和流式 SSE 读取。
+ * 外部 signal 仍可提前取消;只有本定时器触发时才转换成明确的超时报错。
+ */
+async function withTimeout<T>(
+  timeoutSec: number,
+  externalSignal: AbortSignal | undefined,
+  label: string,
+  task: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const onExternalAbort = () => ctrl.abort();
+  if (externalSignal?.aborted) onExternalAbort();
+  else externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, Math.max(1000, timeoutSec * 1000));
+
+  try {
+    return await task(ctrl.signal);
+  } catch (e) {
+    if (timedOut) throw new ApiError(`${label}超时(>${timeoutSec}秒)`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    externalSignal?.removeEventListener('abort', onExternalAbort);
+  }
 }
 
 /**
@@ -76,33 +115,36 @@ export async function requestCompletion(
     if (key) delete body[key];
   }
 
-  const resp = await fetch(GENERATE_URL, {
-    method: 'POST',
-    headers: ctx.getRequestHeaders(),
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
+  const timeoutSec = validTimeoutSec(channel.timeoutSec);
+  return withTimeout(timeoutSec, opts.signal, '副 API 请求', async signal => {
+    const resp = await fetch(GENERATE_URL, {
+      method: 'POST',
+      headers: ctx.getRequestHeaders(),
+      body: JSON.stringify(body),
+      signal,
+    });
 
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new ApiError(`副 API 请求失败 (${resp.status}): ${text.slice(0, 300)}`);
-  }
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new ApiError(`副 API 请求失败 (${resp.status}): ${text.slice(0, 300)}`);
+    }
 
-  // 流式:按 SSE 增量拼接;非流式:直接解析 JSON。
-  if (stream) {
-    const content = await readSseContent(resp);
+    // 流式:按 SSE 增量拼接;非流式:直接解析 JSON。
+    if (stream) {
+      const content = await readSseContent(resp);
+      if (!content) throw new ApiError('副 API 返回空内容');
+      return content;
+    }
+
+    const data = await resp.json();
+    if (data?.error) {
+      throw new ApiError(data.error.message || '副 API 返回错误');
+    }
+
+    const content = extractContent(data);
     if (!content) throw new ApiError('副 API 返回空内容');
     return content;
-  }
-
-  const data = await resp.json();
-  if (data?.error) {
-    throw new ApiError(data.error.message || '副 API 返回错误');
-  }
-
-  const content = extractContent(data);
-  if (!content) throw new ApiError('副 API 返回空内容');
-  return content;
+  });
 }
 
 /**
@@ -199,7 +241,9 @@ const STATUS_URL = '/api/backends/chat-completions/status';
  * 拉取渠道可用的模型列表(走 ST 的 /status 代理,标准 /v1/models)。
  * 只需 url + key,不需要先填 model。
  */
-export async function fetchModels(channel: Pick<ApiChannel, 'url' | 'key'>): Promise<string[]> {
+export async function fetchModels(
+  channel: Pick<ApiChannel, 'url' | 'key'> & Partial<Pick<ApiChannel, 'timeoutSec'>>,
+): Promise<string[]> {
   const ctx = getContext();
   if (!ctx) throw new ApiError('SillyTavern 上下文不可用');
   if (!channel.url) throw new ApiError('请先填写 API 地址');
@@ -210,26 +254,30 @@ export async function fetchModels(channel: Pick<ApiChannel, 'url' | 'key'>): Pro
     proxy_password: channel.key || '',
   };
 
-  const resp = await fetch(STATUS_URL, {
-    method: 'POST',
-    headers: ctx.getRequestHeaders(),
-    body: JSON.stringify(body),
+  const timeoutSec = validTimeoutSec(channel.timeoutSec);
+  return withTimeout(timeoutSec, undefined, '拉取模型', async signal => {
+    const resp = await fetch(STATUS_URL, {
+      method: 'POST',
+      headers: ctx.getRequestHeaders(),
+      body: JSON.stringify(body),
+      signal,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new ApiError(`拉取模型失败 (${resp.status}): ${text.slice(0, 200)}`);
+    }
+
+    const data = await resp.json();
+    if (data?.error && !Array.isArray(data?.data)) {
+      throw new ApiError(data?.message || '拉取模型失败');
+    }
+
+    const list: unknown = data?.data ?? data?.models ?? [];
+    if (!Array.isArray(list)) return [];
+    return list
+      .map((m: any) => (typeof m === 'string' ? m : m?.id))
+      .filter((x: unknown): x is string => typeof x === 'string' && x.length > 0)
+      .sort();
   });
-
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new ApiError(`拉取模型失败 (${resp.status}): ${text.slice(0, 200)}`);
-  }
-
-  const data = await resp.json();
-  if (data?.error && !Array.isArray(data?.data)) {
-    throw new ApiError(data?.message || '拉取模型失败');
-  }
-
-  const list: unknown = data?.data ?? data?.models ?? [];
-  if (!Array.isArray(list)) return [];
-  return list
-    .map((m: any) => (typeof m === 'string' ? m : m?.id))
-    .filter((x: unknown): x is string => typeof x === 'string' && x.length > 0)
-    .sort();
 }

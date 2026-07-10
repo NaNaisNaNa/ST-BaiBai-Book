@@ -4,7 +4,7 @@ import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { appendOpToLatestLeaf, deleteLeafAt, deleteSummary, editLeafAt, editPlan, editSummary } from '@/memory/apply';
 import { apiSettings } from '@/api/settings';
-import { batchBackfill, batchState, cancelBatchBackfill, engineState, resummarizeNow, summarizeFloor, summarizeSelected } from '@/memory/engine';
+import { batchBackfill, batchState, cancelBatchBackfill, engineState, floorBackfillState, resummarizeNow, summarizeFloor, summarizeSelected } from '@/memory/engine';
 import { refreshInjection, selectViewNodes, type ViewNode } from '@/memory/inject';
 import { compactTimeLabel, formatRange, splitTimeLabel } from '@/memory/timeTag';
 import { relativeTimeLabel, weekdayLabel } from '@/memory/timeRel';
@@ -178,15 +178,18 @@ function savePlanEdit() {
 /* ============ 未摘要楼层 ============
  * derivedMeta.pendingFloors = AI 楼且无有效叶子,由旧到新;此处倒序展示(新楼在前)。 */
 const pendingFloors = computed(() => [...derivedMeta.pendingFloors].sort((a, b) => b - a));
-const summarizingFloor = ref<number | null>(null);
-async function summarizeOne(floor: number) {
+const summarizingFloor = computed<number | null>(() => {
+  // derivedMeta.rev 让切聊天后的 computed 重新核对当前 chatId。
+  void derivedMeta.rev;
+  const chatId = getContext()?.getCurrentChatId?.() ?? '';
+  return floorBackfillState.running && floorBackfillState.chatId === chatId
+    ? floorBackfillState.floor
+    : null;
+});
+function summarizeOne(floor: number) {
   if (engineState.running || summarizingFloor.value !== null) return;
-  summarizingFloor.value = floor;
-  try {
-    await summarizeFloor(floor);
-  } finally {
-    summarizingFloor.value = null;
-  }
+  // 任务状态由 engine 的 floorBackfillState 维护;页面卸载/重开不会丢失。
+  void summarizeFloor(floor);
 }
 
 /* ============ 批量补摘 ============

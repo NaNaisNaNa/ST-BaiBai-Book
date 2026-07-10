@@ -75,10 +75,12 @@
   letter-spacing: -0.01em;
   margin: 0;
 }
+
 /* 区块/分页标题:比主标题(22px)小一号,跨页统一(摘要/悬念簿/物品/设置) */
 .bbs-title-sub {
   font-size: 18px;
 }
+
 @media (max-width: 640px) {
   .bbs-title-sub {
     font-size: 16px;
@@ -104,23 +106,28 @@
     border-color var(--bbs-dur) var(--bbs-ease),
     opacity var(--bbs-dur) var(--bbs-ease);
 }
+
 .bbs-btn:hover {
   border-color: var(--bbs-accent);
   color: var(--bbs-accent);
 }
+
 .bbs-btn:disabled {
   opacity: 0.55;
   cursor: default;
 }
+
 .bbs-btn:focus-visible {
   outline: 2px solid var(--bbs-accent);
   outline-offset: 1px;
 }
+
 .bbs-btn-primary {
   background: var(--bbs-accent);
   border-color: var(--bbs-accent);
   color: var(--bbs-accent-ink);
 }
+
 .bbs-btn-primary:hover {
   color: var(--bbs-accent-ink);
   opacity: 0.9;
@@ -137,6 +144,7 @@
   font-family: var(--bbs-font-sans);
   font-size: 13px;
 }
+
 .bbs-input:focus {
   outline: none;
   border-color: var(--bbs-accent);
@@ -156,6 +164,7 @@
   justify-content: space-between;
   gap: 12px;
 }
+
 /* 标题旁的小「+」:无框、muted,平时低调,hover 才浮现强调色 */
 .bbs-add-mini {
   flex: 0 0 auto;
@@ -173,10 +182,12 @@
   cursor: pointer;
   transition: color 0.15s, background 0.15s;
 }
+
 .bbs-add-mini:hover:not(:disabled) {
   color: var(--bbs-accent);
   background: var(--bbs-surface-2);
 }
+
 .bbs-add-mini:disabled {
   opacity: 0.4;
   cursor: default;
@@ -207,6 +218,7 @@
   background: var(--bbs-overlay);
   backdrop-filter: blur(3px);
 }
+
 .bbs-modal {
   width: 100%;
   max-width: 520px;
@@ -222,6 +234,7 @@
   border: 1px solid var(--bbs-line);
   box-shadow: var(--bbs-shadow);
 }
+
 /* 标题栏固定:弹窗内容超长时整体滚动,但标题+关闭键随 sticky 钉在顶部不跟滚。
    负 margin 抵消 .bbs-modal 的 18px 内边距,让标题栏横向铺满、滚动时其不透明背景
    盖住下方滚上来的内容(否则内容会从标题区透出)。padding 补回内边距。
@@ -238,20 +251,24 @@
   padding: 18px 18px 12px;
   background: var(--bbs-bg);
 }
+
 .bbs-modal-title {
   font-weight: 600;
   font-size: 15px;
   color: var(--bbs-ink);
 }
+
 .bbs-modal-field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
 }
+
 .bbs-modal-label {
   font-size: 12px;
   color: var(--bbs-ink-soft);
 }
+
 .bbs-modal-foot {
   display: flex;
   justify-content: flex-end;
@@ -266,22 +283,27 @@
 .bbs-modal-leave-active {
   transition: opacity 0.15s var(--bbs-ease);
 }
+
 .bbs-modal-enter-active .bbs-modal,
 .bbs-modal-leave-active .bbs-modal {
   transition:
     opacity 0.15s var(--bbs-ease),
     transform 0.15s var(--bbs-ease);
 }
+
 .bbs-modal-enter-from,
 .bbs-modal-leave-to {
   opacity: 0;
 }
+
 .bbs-modal-enter-from .bbs-modal,
 .bbs-modal-leave-to .bbs-modal {
   opacity: 0;
   transform: translateY(8px) scale(0.97);
 }
+
 @media (prefers-reduced-motion: reduce) {
+
   .bbs-modal-enter-active,
   .bbs-modal-leave-active,
   .bbs-modal-enter-active .bbs-modal,
@@ -330,19 +352,23 @@
   background: var(--bbs-surface);
   padding: 14px 16px;
 }
+
 /* 展开出的子行:弱化(淡底 + 虚线边),视觉上从属于上方的总结 */
 .bbs-summary-card.is-child {
   background: var(--bbs-surface-2);
   border-style: dashed;
 }
+
 /* 深层总结 / 展开态:左缘点亮强调色(展开态即时反馈「这条已展开」) */
 .bbs-summary-card.is-deep,
 .bbs-summary-card.is-expanded {
   border-left: 3px solid var(--bbs-accent);
 }
+
 .bbs-summary-card.is-stale {
   opacity: 0.6;
 }
+
 .bbs-summary-meta {
   display: flex;
   align-items: center;
@@ -350,11 +376,13 @@
   margin-bottom: 6px;
   flex-wrap: wrap;
 }
+
 /* 绝对时间作题首文本,line-height:1 让它与同行等高标签的视觉中心对齐 */
 .bbs-summary-dateline,
 .bbs-summary-time {
   line-height: 1;
 }
+
 /* 摘要题首:故事内时间升为主标题,稍大、半粗、tabular 数字像账册日期 */
 .bbs-summary-dateline {
   font-size: 14px;
@@ -363,6 +391,7 @@
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.01em;
 }
+
 /* 标签与楼层号:高度一致(同 height + 居中);楼层号最小宽 = 摘要标签宽,数字变长再撑开 */
 .bbs-summary-badge,
 .bbs-summary-loc {
@@ -377,11 +406,14 @@
   font-weight: 600;
   border-radius: var(--bbs-radius-sm);
 }
+
 .bbs-summary-badge {
   color: var(--bbs-accent-ink);
   background: var(--bbs-accent);
-  border: 1px solid var(--bbs-accent); /* 与 loc 同样 1px 边框,保证两者等高 */
+  border: 1px solid var(--bbs-accent);
+  /* 与 loc 同样 1px 边框,保证两者等高 */
 }
+
 /* 楼层号/收纳数:描边定位标签;tabular 数字对齐 */
 .bbs-summary-loc {
   color: var(--bbs-ink-soft);
@@ -389,10 +421,12 @@
   border: 1px solid var(--bbs-line);
   font-variant-numeric: tabular-nums;
 }
+
 .bbs-summary-time {
   font-size: 12px;
   color: var(--bbs-ink-soft);
 }
+
 /* 相对时间(昨天/3天前…):等高小标签,与楼层药丸同高,靠盒子居中免去 CJK 基线下沉 */
 .bbs-summary-rel {
   box-sizing: border-box;
@@ -407,6 +441,7 @@
   background: var(--bbs-accent-soft);
   border: 1px solid var(--bbs-accent);
 }
+
 .bbs-summary-stale {
   font-size: 11px;
   color: var(--bbs-warning);
@@ -414,6 +449,7 @@
   border-radius: var(--bbs-radius-sm);
   padding: 2px 8px;
 }
+
 /* 动作组靠右;平时隐身,hover/聚焦该卡才浮现 */
 .bbs-summary-acts {
   margin-left: auto;
@@ -422,10 +458,12 @@
   opacity: 0;
   transition: opacity 0.15s;
 }
+
 .bbs-summary-card:hover .bbs-summary-acts,
 .bbs-summary-card:focus-within .bbs-summary-acts {
   opacity: 1;
 }
+
 .bbs-summary-act {
   flex: 0 0 auto;
   display: inline-flex;
@@ -441,14 +479,17 @@
   cursor: pointer;
   transition: color 0.15s, background 0.15s;
 }
+
 .bbs-summary-act:hover {
   color: var(--bbs-accent);
   background: var(--bbs-surface-2);
 }
+
 .bbs-summary-del:hover {
   color: var(--bbs-danger);
   background: var(--bbs-danger-soft);
 }
+
 .bbs-summary-text {
   margin: 0;
   font-size: 13px;
@@ -457,6 +498,7 @@
   color: var(--bbs-ink-soft);
   white-space: pre-wrap;
 }
+
 /* —— 展开开关:卡片底部整条(而非左侧小箭头),整条可点、目标大(移动端友好),
    顶部细线与正文隔开,像卡片的「页脚操作区」。明确标注「展开/收起下层 N 条」。 */
 .bbs-expand-bar {
@@ -476,15 +518,19 @@
   cursor: pointer;
   transition: color 0.15s;
 }
+
 .bbs-expand-bar:hover {
   color: var(--bbs-accent);
 }
+
 .bbs-expand-caret {
   transition: transform 0.2s ease;
 }
+
 .bbs-expand-caret.is-collapsed {
   transform: rotate(-90deg);
 }
+
 /* —— 组尾收起条:展开内容末尾的就地收回入口(滚到底不必翻回顶部)。
    虚线上边、无卡底,像「合上这一叠」的收口。 */
 .bbs-collapse-footer {
@@ -501,20 +547,24 @@
   cursor: pointer;
   transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
+
 .bbs-collapse-footer:hover {
   color: var(--bbs-accent);
   border-color: var(--bbs-accent);
   background: var(--bbs-accent-soft);
 }
+
 /* 收起条箭头恒朝上(收起方向) */
 .bbs-collapse-caret {
   transform: rotate(180deg);
 }
+
 /* 触屏无 hover:动作键常显但保持小而 muted;触达区放大到 ~32px */
 @media (hover: none) {
   .bbs-summary-acts {
     opacity: 1;
   }
+
   .bbs-summary-act {
     width: 32px;
     height: 32px;
@@ -522,13 +572,16 @@
     color: var(--bbs-ink-muted);
   }
 }
+
 @media (prefers-reduced-motion: reduce) {
   .bbs-expand-caret {
     transition: none;
   }
 }
+
 /* 窄屏:绝对时间(纯文本较长)排到末尾独占一行,首行只留标签 + 操作键 */
 @media (max-width: 640px) {
+
   .bbs-summary-dateline,
   .bbs-summary-time {
     order: 99;
@@ -538,13 +591,17 @@
 
 /* —— 隐藏滚动条(保留滚动能力):整个 UI 内统一 —— */
 .bbs-root * {
-  scrollbar-width: none; /* Firefox */
-  -ms-overflow-style: none; /* 旧 Edge/IE */
+  scrollbar-width: none;
+  /* Firefox */
+  -ms-overflow-style: none;
+  /* 旧 Edge/IE */
 }
+
 .bbs-root *::-webkit-scrollbar {
   width: 0;
   height: 0;
-  display: none; /* Chrome/Safari */
+  display: none;
+  /* Chrome/Safari */
 }
 
 /* ============ 响应式:移动端整屏(底部抽屉式) ============ */
@@ -553,6 +610,7 @@
     padding: 0;
     align-items: flex-end;
   }
+
   .bbs-window {
     max-width: 100%;
     width: 100%;

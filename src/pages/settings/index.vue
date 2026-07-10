@@ -117,6 +117,10 @@ function closeChannel() {
 function confirmChannel() {
   const draft = editingChannel.value;
   if (draft) {
+    draft.timeoutSec =
+      Number.isFinite(draft.timeoutSec) && draft.timeoutSec > 0
+        ? Math.floor(draft.timeoutSec)
+        : 180;
     const list = channelsOf(editingScope.value);
     if (editingId.value) {
       const idx = list.findIndex(c => c.id === editingId.value);
@@ -323,7 +327,7 @@ async function pullVecModels(role: VectorRole) {
   vecLoadingModels.value[role] = true;
   vecModelMsg.value[role] = '';
   try {
-    const list = await fetchModels({ url: ep.url, key: ep.key });
+    const list = await fetchModels({ url: ep.url, key: ep.key, timeoutSec: ep.timeoutSec });
     vecModels.value[role] = list;
     if (list.length && !apiSettings.vector[role].model) apiSettings.vector[role].model = list[0];
     if (!list.length) vecModelMsg.value[role] = '未返回任何模型';
@@ -1658,6 +1662,10 @@ function exportPublicApiDocument() {
             <span>最大 token</span>
             <input v-model.number="editingChannel.maxTokens" class="bbs-input" type="number" step="256" min="256" />
           </label>
+          <label class="bbs-mini-field">
+            <span>超时(秒)</span>
+            <input v-model.number="editingChannel.timeoutSec" class="bbs-input" type="number" step="10" min="1" />
+          </label>
         </div>
         <label class="bbs-switch-row">
           <span class="bbs-modal-label">流式传输</span>
@@ -2311,6 +2319,7 @@ function exportPublicApiDocument() {
 }
 .bbs-mini-field {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;

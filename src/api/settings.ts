@@ -23,6 +23,8 @@ export interface ApiChannel {
   temperature: number;
   /** 最大输出 token */
   maxTokens: number;
+  /** 单次请求超时(秒)。超过后主动中断;每个渠道独立配置,默认 180 秒。 */
+  timeoutSec: number;
   /** 流式传输(默认关);开启后按 SSE 增量拼接 */
   stream: boolean;
   /**
@@ -363,7 +365,7 @@ function normalize(raw: unknown): ApiSettings {
     Number.isFinite(merged.vector.queryRewriteMaxTokens) && merged.vector.queryRewriteMaxTokens >= 256
       ? Math.floor(merged.vector.queryRewriteMaxTokens)
       : 8192;
-  // 副 API 渠道:逐个补全新加的字段(老数据没有 stream/excludeParams),并校验类型
+  // 副 API 渠道:逐个补全新加的字段(老数据没有 timeoutSec/stream/excludeParams),并校验类型
   merged.channels = (Array.isArray(merged.channels) ? merged.channels : []).map(normalizeChannel);
   // 字数档位:仅两个合法值,旧数据缺失/非法回退详细(= 老用户行为不变)
   merged.verbosity = merged.verbosity === 'concise' ? 'concise' : 'detailed';
@@ -454,7 +456,7 @@ function normalizeVectorEndpoint(
   };
 }
 
-/** 补全单个渠道的缺失字段(stream/excludeParams 是后加的),并校验类型。 */
+/** 补全单个渠道的缺失字段(timeoutSec/stream/excludeParams 是后加的),并校验类型。 */
 function normalizeChannel(c: Partial<ApiChannel>): ApiChannel {
   return {
     id: typeof c.id === 'string' ? c.id : `ch_${Date.now()}_${++chanSeq}`,
@@ -464,6 +466,10 @@ function normalizeChannel(c: Partial<ApiChannel>): ApiChannel {
     model: typeof c.model === 'string' ? c.model : '',
     temperature: typeof c.temperature === 'number' ? c.temperature : 1.0,
     maxTokens: typeof c.maxTokens === 'number' ? c.maxTokens : 65535,
+    timeoutSec:
+      typeof c.timeoutSec === 'number' && Number.isFinite(c.timeoutSec) && c.timeoutSec > 0
+        ? Math.floor(c.timeoutSec)
+        : 180,
     stream: typeof c.stream === 'boolean' ? c.stream : false,
     prefill: typeof c.prefill === 'boolean' ? c.prefill : true, // 后加字段:老数据默认开(保持原行为)
     excludeParams: Array.isArray(c.excludeParams)
@@ -609,6 +615,7 @@ export function newChannel(): ApiChannel {
     model: '',
     temperature: 1.0,
     maxTokens: 65535,
+    timeoutSec: 180,
     stream: false,
     prefill: true,
     excludeParams: [],
