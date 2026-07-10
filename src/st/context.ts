@@ -168,6 +168,38 @@ export function getContext(): STContext | null {
 }
 
 /**
+ * 把文本追加到 ST 主输入框，不触发发送。
+ * 派发 input 事件以同步 ST 的输入框高度、发送按钮和草稿相关状态。
+ */
+export function appendChatInput(text: string): boolean {
+  try {
+    const value = text.trim();
+    const textarea = document.querySelector<HTMLTextAreaElement>('#send_textarea');
+    if (!value || !textarea) return false;
+
+    const existing = textarea.value;
+    const separator = !existing
+      ? ''
+      : existing.endsWith('\n\n')
+        ? ''
+        : existing.endsWith('\n')
+          ? '\n'
+          : '\n\n';
+    textarea.value = `${existing}${separator}${value}`;
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+
+    requestAnimationFrame(() => {
+      textarea.focus();
+      const end = textarea.value.length;
+      textarea.setSelectionRange(end, end);
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 更新消息正文时同步当前 swipe。
  *
  * ST 的保存格式里 `mes` 和 `swipes[swipe_id]` 都会存在；只改 `mes` 会造成当前页

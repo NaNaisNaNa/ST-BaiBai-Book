@@ -427,6 +427,59 @@ function fmtNpcContext(npcs: MemNpc[], scenes: MemScene[], here: string, locatio
   return lines.join('\n');
 }
 
+/**
+ * 渲染指定地点视角下的物品上下文。
+ * 正常状态注入与「前往地点」草稿共用这一入口，确保寄存物品的可达判定不会分叉。
+ */
+function fmtItemContext(items: MemItem[], scenes: MemScene[], here: string, locationPath?: string[]): string[] {
+  const current = findCurrentScene(scenes, here, locationPath);
+  const sceneIndex = buildSceneLocationIndex(scenes);
+  const reachable: MemItem[] = [];
+  const elsewhere: MemItem[] = [];
+
+  for (const item of items) {
+    if (item.carried !== false || itemReachableAtScene(scenes, item.location, current, here, sceneIndex)) {
+      reachable.push(item);
+    } else {
+      elsewhere.push(item);
+    }
+  }
+
+  const blocks = [
+    `物品清单:\n${fmtItems(reachable.map(i => ({ name: i.name, qty: i.qty, desc: i.desc, carried: i.carried, location: i.location })))}`,
+  ];
+  if (elsewhere.length) {
+    const brief = elsewhere
+      .map(i => `  - ${i.name}${typeof i.qty === 'number' ? ` ×${i.qty}` : ''}(存:${oneLine(i.location) || '某处'})`)
+      .join('\n');
+    blocks.push(`他处寄存物品(回到对应地点才有完整信息):\n${brief}`);
+  }
+  return blocks;
+}
+
+/**
+ * 为场景页的「前往」操作生成可编辑的用户草稿。
+ * 只临时把目标节点当作当前地点来计算场景、物品和 NPC 上下文，不修改 memory.state。
+ */
+export function buildTravelDraft(target: MemScene): string {
+  const here = target.name;
+  const locationPath = target.path;
+  const destination = target.path.join(' › ');
+  const blocks: string[] = [];
+
+  const sceneBlock = fmtSceneContext(memory.scenes, here, locationPath);
+  if (sceneBlock) blocks.push(`地点记忆:\n${sceneBlock}`);
+  blocks.push(...fmtItemContext(memory.items, memory.scenes, here, locationPath));
+
+  const npcBlock = fmtNpcContext(memory.npcs, memory.scenes, here, locationPath);
+  if (npcBlock) blocks.push(`NPC名册:\n${npcBlock}`);
+
+  return [
+    `前往「${destination}」，请从抵达后继续剧情。`,
+    `以下是抵达该地点后的相关记忆，请保持设定一致:\n${blocks.join('\n')}`,
+  ].join('\n\n');
+}
+
 /** 组合当前结构化状态注入文本;无有意义状态时返回空串。 */
 export function buildStateInjectionText(): string {
   const st: string[] = [];
@@ -442,28 +495,10 @@ export function buildStateInjectionText(): string {
   // 场景树:当前地点 + 祖先链(详细) + 其他地点(仅名称)。祖先链同时用于物品/NPC 可达判定。
   const sceneBlock = fmtSceneContext(memory.scenes, here, locPath);
   if (sceneBlock) st.push(`地点记忆:\n${sceneBlock}`);
-  const current = findCurrentScene(memory.scenes, here, locPath);
-  const sceneIndex = buildSceneLocationIndex(memory.scenes);
 
   // 物品分两组省 token:可达(随身 / 存放地落在当前地点或其祖先链)发全量(名+量+描述);
   // 他处寄存的只发名+数量(砍掉描述这个大头),既省 token 又不至于让主模型以为东西没了。
-  const reachable: MemItem[] = [];
-  const elsewhere: MemItem[] = [];
-  for (const item of memory.items) {
-    if (item.carried !== false || itemReachableAtScene(memory.scenes, item.location, current, here, sceneIndex)) {
-      reachable.push(item);
-    } else {
-      elsewhere.push(item);
-    }
-  }
-  st.push(`物品清单:\n${fmtItems(reachable.map(i => ({ name: i.name, qty: i.qty, desc: i.desc, carried: i.carried, location: i.location })))}`);
-  if (elsewhere.length) {
-    // 仅名+数量,按地点括注;无描述
-    const brief = elsewhere
-      .map(i => `  - ${i.name}${typeof i.qty === 'number' ? ` ×${i.qty}` : ''}(存:${oneLine(i.location) || '某处'})`)
-      .join('\n');
-    st.push(`他处寄存物品(回到对应地点才有完整信息):\n${brief}`);
-  }
+  st.push(...fmtItemContext(memory.items, memory.scenes, here, locPath));
   // 注:近期物品变动不在此注入。改为摘要后写进对应楼层正文 </bbs_end> 之后(见 engine.ts),
   // 窗口内全文楼层天然可见、滚出窗口自然消失 —— 符合「物品变动只在那段时间有用」的取舍。
 

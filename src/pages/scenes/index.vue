@@ -3,8 +3,11 @@ import Icon from '@/components/Icon.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { buildSceneLocationIndex, editSceneDesc, findCurrentSceneId, removeScene, reparentScene, resolveSceneLocationId, upsertScene } from '@/memory/apply';
+import { buildTravelDraft } from '@/memory/inject';
 import { derivedMeta, memory } from '@/memory/store';
-import { getContext } from '@/st/context';
+import { closeBook } from '@/state/ui';
+import { appendChatInput, getContext } from '@/st/context';
+import { toast } from '@/st/toast';
 import type { MemItem, MemScene } from '@/memory/types';
 import { computed, nextTick, ref, watch } from 'vue';
 
@@ -259,6 +262,23 @@ const removeChildCount = computed(() => {
   const prefix = `${n.id}/`;
   return memory.scenes.filter(s => s.id.startsWith(prefix)).length;
 });
+
+/* —— 前往地点:只生成草稿,不提前修改派生状态 —— */
+const traveling = ref<MemScene | null>(null);
+function askTravel(node: MemScene) {
+  traveling.value = node;
+}
+function confirmTravel() {
+  const target = traveling.value;
+  if (!target) return;
+  if (!appendChatInput(buildTravelDraft(target))) {
+    toast('无法写入 ST 输入框', 'error');
+    return;
+  }
+  traveling.value = null;
+  closeBook();
+  toast('前往地点草稿已填入输入框', 'success');
+}
 </script>
 
 <template>
@@ -308,6 +328,7 @@ const removeChildCount = computed(() => {
             <span v-if="r.isCurrent" class="bbs-scene-here"><Icon name="scenes" />所在</span>
             <span v-else-if="r.isCollapsed" class="bbs-scene-count">{{ childCount(r.node) }}</span>
             <span class="bbs-scene-acts">
+              <button v-if="!r.isCurrent" class="bbs-item-act" type="button" title="前往" @click.stop="askTravel(r.node)"><Icon name="navigate" /></button>
               <button class="bbs-item-act" type="button" title="编辑" @click.stop="openEdit(r.node)"><Icon name="edit" /></button>
               <button class="bbs-item-act bbs-item-del" type="button" title="删除" @click.stop="askRemove(r.node)"><Icon name="trash" /></button>
             </span>
@@ -389,6 +410,18 @@ const removeChildCount = computed(() => {
         </footer>
       </div>
     </ModalMask>
+
+    <ConfirmDialog
+      :open="!!traveling"
+      title="前往地点"
+      confirm-text="填入输入框"
+      confirm-icon="navigate"
+      @update:open="v => { if (!v) traveling = null; }"
+      @confirm="confirmTravel"
+      @cancel="traveling = null"
+    >
+      确定前往「{{ traveling?.path.join(' › ') }}」？将按抵达后的地点状态生成草稿；不会自动发送，也不会提前修改记忆。输入框已有内容时会追加在末尾。
+    </ConfirmDialog>
 
     <ConfirmDialog
       :open="!!removing"
