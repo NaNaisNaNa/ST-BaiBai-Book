@@ -126,6 +126,7 @@ function stripCustomTags(s: string): string {
  *  ② 裁剪到时间标签区间:取「最后一个 <bbs_start>」+「第一个 </bbs_end>」之间(标签保留)——
  *     思维链/状态栏可能混入同名标签,开始标签取末次、结束标签取首次,精准框出真正的正文段;
  *     仅在对应标签存在时才裁剪,缺标签的一侧保持原样(两侧都没有则不裁,覆盖「旧聊天无标签」场景)。
+ *     `<content>` 等其它容器标签不参与边界判断,避免时间标签位于容器外时被提前截掉。
  *  ③ 规范空白。
  *
  * 注:历史上这里之后还跟一道 stripHtml 做「删所有标签留内容」,反而把自定义标签删没、令整块清洗失效;
@@ -273,25 +274,12 @@ function readManagedTagText(mes: string, tag: string): string | null {
   return block ? s.slice(start + block.innerStart, start + block.innerEnd).trim() : null;
 }
 
-function cropToContentBlock(s: string): string {
-  const openRe = /<content\b[^>]*>/gi;
-  let lastOpen: { start: number; end: number } | null = null;
-  for (let m = openRe.exec(s); m; m = openRe.exec(s)) {
-    lastOpen = { start: m.index, end: m.index + m[0].length };
-  }
-  if (!lastOpen) return s;
-  const rest = s.slice(lastOpen.end);
-  const close = rest.match(/<\/content>/i);
-  return close && close.index !== undefined ? rest.slice(0, close.index) : rest;
-}
-
 export function clampToTimeTags(mes: string): string {
   let s = String(mes ?? '')
     .replace(RE_THINK_BLOCK, '') // 思维链
     .replace(/<!--[\s\S]+?-->/g, '') // HTML 注释
     .replace(/<horae[\s\S]*?>[\s\S]*?<\/horae[\s\S]*?>/gi, ''); // 旧 horae 格式
   s = stripCustomTags(s); // 用户自定义标签
-  s = cropToContentBlock(s); // 未闭合 thinking 或格式说明里的伪时间标签不应参与裁剪
   s = stripManagedTags(s); // 仅清理插件托管的尾部旁注
 
   // 最后一个 <bbs_start> 的位置:全局扫一遍取末次
