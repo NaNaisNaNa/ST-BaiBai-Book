@@ -914,7 +914,10 @@ async function sendAndParse<T>(
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (signal?.aborted) throw new DOMException('补摘请求已取消', 'AbortError');
     try {
-      return parse(await send(messages, signal));
+      const raw = await send(messages, signal);
+      // 空回复必须和网络错误、掉格式一样进入重试，不能被当作一次成功请求放行。
+      if (!raw.trim()) throw new Error('摘要失败:AI空回');
+      return parse(raw);
     } catch (e) {
       if (signal?.aborted) throw new DOMException('补摘请求已取消', 'AbortError');
       lastErr = e;
@@ -1184,6 +1187,10 @@ export interface BatchBackfillResult {
   total: number;
   /** 是否因取消提前结束 */
   cancelled: boolean;
+  /** 逐行模式重试耗尽后停止所在的楼层；批量模式不设置。 */
+  failedFloor?: number;
+  /** 导致逐行模式停止的最终错误。 */
+  failedError?: string;
 }
 
 /**
@@ -1409,7 +1416,8 @@ export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<Batch
  * 逐行补摘:把待摘 AI 楼从旧到新严格串行处理,每楼走完整单楼摘要协议。
  * 与批量补摘不同,这里保留物品/场景/NPC/计划/地点/主角档案/变量等全部结构化增量。
  * 后一楼必须等待前一楼落叶并重算派生状态后才发请求,确保它能读取前楼的新状态。
- * 单楼失败时保留该楼待摘并继续后续；取消会立即中止当前楼的在途请求。
+ * 单楼失败会按设置重试；重试耗尽后保留该楼并立即停止，绝不让后续楼基于缺失状态继续。
+ * 取消会立即中止当前楼的在途请求。
  */
 export async function sequentialBackfill(opts: BatchBackfillOpts = {}): Promise<BatchBackfillResult> {
   if (!engineActiveHere()) return { done: 0, total: 0, cancelled: false };
@@ -1445,6 +1453,8 @@ export async function sequentialBackfill(opts: BatchBackfillOpts = {}): Promise<
   backfillAbortController = abortController;
   let done = 0;
   let cancelled = false;
+  let failedFloor: number | undefined;
+  let failedError: string | undefined;
   try {
     for (const floor of floors) {
       if (batchState.cancelRequested) { cancelled = true; break; }
@@ -1460,14 +1470,19 @@ export async function sequentialBackfill(opts: BatchBackfillOpts = {}): Promise<
         await summarizeFloorWork(chat, floor, sender, { signal: abortController.signal });
       } catch (e) {
         if (abortController.signal.aborted) { cancelled = true; break; }
-        engineState.lastError = e instanceof Error ? e.message : String(e);
-        console.log('[柏宝书] 逐行补摘单楼失败,继续后续:', floor, engineState.lastError);
+        failedFloor = floor;
+        failedError = e instanceof Error ? e.message : String(e);
+        engineState.lastError = `逐行补摘在楼层 #${floor} 停止：${failedError}。为避免状态错乱，后续楼层没有继续处理。`;
+        console.error('[柏宝书] 逐行补摘单楼重试耗尽,停止后续:', floor, failedError);
+        break;
       }
       done = floors.filter(f => leafValid(chat[f])).length;
       batchState.done = done;
     }
-    // 主动取消时不再发总结请求；全部叶子正常处理完后才统一连锁生成 L1/L2。
-    if (!cancelled && !abortController.signal.aborted) await checkResummary(abortController.signal);
+    // 主动取消或中途失败时都不再发总结请求；全部叶子正常处理完后才统一连锁生成 L1/L2。
+    if (!cancelled && failedFloor === undefined && !abortController.signal.aborted) {
+      await checkResummary(abortController.signal);
+    }
   } catch (e) {
     if (abortController.signal.aborted) cancelled = true;
     else engineState.lastError = e instanceof Error ? e.message : String(e);
@@ -1480,7 +1495,7 @@ export async function sequentialBackfill(opts: BatchBackfillOpts = {}): Promise<
     if (backfillAbortController === abortController) backfillAbortController = null;
   }
   await afterSummaryHideAndInject(chat);
-  return { done, total, cancelled };
+  return { done, total, cancelled, failedFloor, failedError };
 }
 
 

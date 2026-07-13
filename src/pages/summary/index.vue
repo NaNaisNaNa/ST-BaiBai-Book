@@ -260,8 +260,10 @@ function runSequentialBackfill() {
         toast('待补摘楼层已经发生变化,没有处理任何内容。', 'warning');
       } else if (result.cancelled) {
         toast(`逐行补摘已停止,完成 ${result.done}/${result.total} 楼。`, 'info');
+      } else if (result.failedFloor !== undefined) {
+        toast(`逐行补摘在楼层 #${result.failedFloor} 重试耗尽后停止，后续楼层没有处理。`, 'error');
       } else if (result.done < result.total) {
-        toast(`逐行补摘完成 ${result.done}/${result.total} 楼,失败或失效的楼层仍保留在未摘要列表。`, 'warning');
+        toast(`逐行补摘完成 ${result.done}/${result.total} 楼,失效的楼层仍保留在未摘要列表。`, 'warning');
       } else {
         toast(`逐行补摘完成,共处理 ${result.done} 楼。`, 'success');
       }
