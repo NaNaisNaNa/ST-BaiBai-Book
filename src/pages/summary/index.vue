@@ -4,7 +4,7 @@ import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { appendOpToLatestLeaf, deleteLeafAt, deleteSummary, deleteSummarySelection, editLeafAt, editPlan, editSummary, type SummaryDeleteMode } from '@/memory/apply';
 import { apiSettings } from '@/api/settings';
-import { batchBackfill, batchState, cancelBatchBackfill, engineState, floorBackfillState, resummarizeNow, summarizeFloor, summarizeSelected } from '@/memory/engine';
+import { batchBackfill, batchState, cancelBatchBackfill, engineState, floorBackfillState, resummarizeNow, sequentialBackfill, summarizeFloor, summarizeSelected } from '@/memory/engine';
 import { refreshInjection, selectViewNodes, type ViewNode } from '@/memory/inject';
 import { compactTimeLabel, formatRange, splitTimeLabel } from '@/memory/timeTag';
 import { relativeTimeLabel, weekdayLabel } from '@/memory/timeRel';
@@ -26,6 +26,8 @@ const resetViewStates = () => {
   searchQuery.value = '';
   searchOpen.value = false;
   exitSelectMode();
+  batchConfirmOpen.value = false;
+  cancelSequentialConfirm();
 };
 let offChatChanged: (() => void) | null = null;
 onMounted(() => {
@@ -193,12 +195,13 @@ function summarizeOne(floor: number) {
   void summarizeFloor(floor);
 }
 
-/* ============ 批量补摘 ============
- * 把所有未摘楼层按内容量分块、逐块串行补摘:省 token(固定上下文按块分摊)+ 减请求数。
- * 先弹确认(显示待摘楼数),执行中显示进度 + 可取消(块边界生效)。
- * 运行状态读 engine 的 batchState 单例(非组件本地 ref):关掉柏宝书窗口再重开,
- * 进度条与取消按钮能恢复——因为任务在 engine 里继续跑,关窗不取消。 */
+/* ============ 批量 / 逐行补摘 ============
+ * 批量模式把多楼按内容量分块,省 token、更快;逐行模式则每楼独立请求完整结构化摘要。
+ * 两种模式共用 engine 的 batchState 单例,因此关闭窗口再打开仍可恢复进度与取消按钮。 */
 const batchConfirmOpen = ref(false);
+const sequentialConfirmOpen = ref(false);
+const sequentialFloors = ref<number[]>([]);
+const sequentialChatId = ref('');
 
 function openBatchConfirm() {
   if (engineState.running || !pendingFloors.value.length) return;
@@ -212,6 +215,58 @@ function runBatchBackfill() {
     // 由旧到新补;pendingFloors 是倒序展示用,这里传升序更稳(引擎内部也会再过滤排序)
     floors: [...derivedMeta.pendingFloors].sort((a, b) => a - b),
   });
+}
+
+function openSequentialConfirm() {
+  if (engineState.running || !pendingFloors.value.length) return;
+  // 冻结点击当下的聊天和目标,避免确认期间列表变化导致处理对象悄悄改变。
+  sequentialFloors.value = [...derivedMeta.pendingFloors].sort((a, b) => a - b);
+  sequentialChatId.value = getContext()?.getCurrentChatId?.() ?? '';
+  sequentialConfirmOpen.value = true;
+}
+function cancelSequentialConfirm() {
+  sequentialConfirmOpen.value = false;
+  sequentialFloors.value = [];
+  sequentialChatId.value = '';
+}
+function runSequentialBackfill() {
+  sequentialConfirmOpen.value = false;
+  const floors = [...sequentialFloors.value];
+  const frozenChatId = sequentialChatId.value;
+  sequentialFloors.value = [];
+  sequentialChatId.value = '';
+
+  if (engineState.running) {
+    toast('摘要引擎正在运行,逐行补摘没有启动。', 'warning');
+    return;
+  }
+
+  const currentChatId = getContext()?.getCurrentChatId?.() ?? '';
+  if (currentChatId !== frozenChatId) {
+    toast('当前聊天已经切换,逐行补摘没有启动。', 'warning');
+    return;
+  }
+  const pending = new Set(derivedMeta.pendingFloors);
+  const validFloors = floors.filter(f => pending.has(f));
+  if (!validFloors.length) {
+    toast('所选楼层已经完成摘要或失效,逐行补摘没有启动。', 'warning');
+    return;
+  }
+
+  // 严格串行任务在 engine 中继续运行;页面关闭不会取消,重新打开可从 batchState 恢复进度。
+  void sequentialBackfill({ floors: validFloors })
+    .then(result => {
+      if (!result.total) {
+        toast('待补摘楼层已经发生变化,没有处理任何内容。', 'warning');
+      } else if (result.cancelled) {
+        toast(`逐行补摘已停止,完成 ${result.done}/${result.total} 楼。`, 'info');
+      } else if (result.done < result.total) {
+        toast(`逐行补摘完成 ${result.done}/${result.total} 楼,失败或失效的楼层仍保留在未摘要列表。`, 'warning');
+      } else {
+        toast(`逐行补摘完成,共处理 ${result.done} 楼。`, 'success');
+      }
+    })
+    .catch(e => toast(`逐行补摘失败:${e instanceof Error ? e.message : String(e)}`, 'error'));
 }
 
 /* ============ 立即总结 ============
@@ -795,20 +850,30 @@ provide(SUMMARY_CTX, {
         <span class="bbs-pending-label" :data-count="pendingFloors.length">
           <Icon name="summary" />未摘要楼层
         </span>
-        <!-- 批量补摘:把全部未摘楼层分块串行补完(省 token、减请求);批量进行中显示进度+取消 -->
-        <button
-          v-if="!batchState.running"
-          class="bbs-btn bbs-btn-sm bbs-batch-btn"
-          type="button"
-          :disabled="engineState.running || summarizingFloor !== null"
-          title="把全部未摘楼层分批一次性补完(比逐楼省 token、更快)"
-          @click="openBatchConfirm"
-        >
-          <Icon name="plans" />批量补摘
-        </button>
+        <!-- 空闲时提供快速批量与完整逐行两种模式;运行中统一显示可恢复的进度与取消。 -->
+        <div v-if="!batchState.running" class="bbs-backfill-actions">
+          <button
+            class="bbs-btn bbs-btn-sm bbs-batch-btn"
+            type="button"
+            :disabled="engineState.running || summarizingFloor !== null"
+            title="把全部未摘楼层逐楼生成完整摘要(细节更多,但更耗 token、更慢)"
+            @click="openSequentialConfirm"
+          >
+            <Icon name="summary" />逐行补摘
+          </button>
+          <button
+            class="bbs-btn bbs-btn-sm bbs-batch-btn"
+            type="button"
+            :disabled="engineState.running || summarizingFloor !== null"
+            title="把全部未摘楼层分批一次性补完(比逐楼省 token、更快)"
+            @click="openBatchConfirm"
+          >
+            <Icon name="plans" />批量补摘
+          </button>
+        </div>
         <span v-else class="bbs-batch-progress">
           <span class="bbs-pending-spin"></span>
-          补摘中 {{ batchState.done }}/{{ batchState.total }}
+          {{ batchState.mode === 'sequential' ? '逐行补摘中' : '批量补摘中' }} {{ batchState.done }}/{{ batchState.total }}
           <button class="bbs-batch-cancel" type="button" :disabled="batchState.cancelRequested" @click="cancelBatchBackfill">
             {{ batchState.cancelRequested ? '停止中…' : '取消' }}
           </button>
@@ -839,6 +904,17 @@ provide(SUMMARY_CTX, {
     >
       共 {{ pendingFloors.length }} 个未摘楼层,将按内容量分批、逐批串行补摘(比逐楼省 token、更快)。
       过程中可随时取消(会在当前这批完成后停下)。继续?
+    </ConfirmDialog>
+
+    <!-- 逐行补摘确认弹窗:目标楼层在打开时冻结,取消/遮罩关闭不会启动任务。 -->
+    <ConfirmDialog
+      v-model:open="sequentialConfirmOpen"
+      title="逐行补摘"
+      confirmText="确定"
+      @confirm="runSequentialBackfill"
+      @cancel="cancelSequentialConfirm"
+    >
+      共 {{ sequentialFloors.length }} 个未摘要楼层。逐行补摘会消耗较多token，且用时较长，确定吗
     </ConfirmDialog>
 
     <!-- 当前状态 -->
@@ -1448,10 +1524,11 @@ provide(SUMMARY_CTX, {
   border-radius: var(--bbs-radius);
   background: var(--bbs-accent-soft);
 }
-/* 标题行:标签靠左,批量补摘按钮/进度推到右侧 */
+/* 标题行:标签靠左,两种补摘按钮/进度推到右侧;窄屏允许自然换行。 */
 .bbs-pending-head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
 }
 .bbs-pending-label {
@@ -1462,9 +1539,16 @@ provide(SUMMARY_CTX, {
   font-weight: 600;
   color: var(--bbs-accent);
 }
-/* 批量补摘按钮:推到标题行最右,小一号带图标 */
-.bbs-batch-btn {
+.bbs-backfill-actions {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+/* 补摘按钮:小一号带图标,由外层操作组负责靠右与换行。 */
+.bbs-batch-btn {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
@@ -1829,6 +1913,21 @@ provide(SUMMARY_CTX, {
 
 /* ============ 窄屏:类型切换撑满、状态条整齐 ============ */
 @media (max-width: 640px) {
+  /* 两种补摘模式在窄屏独占下一行并等宽排列,避免标题与按钮互相挤压。 */
+  .bbs-backfill-actions {
+    margin-left: 0;
+    width: 100%;
+  }
+  .bbs-backfill-actions .bbs-batch-btn {
+    flex: 1 1 120px;
+    justify-content: center;
+  }
+  .bbs-batch-progress {
+    margin-left: 0;
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
   /* 删除分支文案较长:窄屏下一行一个按钮,避免挤压或误触。 */
   .bbs-bulk-delete-foot .bbs-btn {
     flex: 1 1 100%;

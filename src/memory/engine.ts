@@ -53,14 +53,17 @@ let floorBackfillOwnerRunId: number | null = null;
  * 放这里而非组件本地 ref:柏宝书窗口关闭会销毁组件、丢失本地 ref,但 batchBackfill 在本模块继续跑——
  * 关窗 ≠ 取消。重开后组件读这个单例即可恢复「补摘中 X/Y + 取消」的显示。
  */
+export type BackfillMode = 'batch' | 'sequential';
+
 export const batchState = reactive({
   running: false,
+  mode: null as BackfillMode | null,
   done: 0,
   total: 0,
-  cancelRequested: false, // 用户已点取消、等块边界生效
+  cancelRequested: false, // 用户已点取消、等当前块/当前楼结束后生效
 });
 
-/** 请求取消正在进行的批量补摘(块边界生效,不打断进行中的块)。 */
+/** 请求取消正在进行的补摘任务(不打断当前块或当前楼的在途请求)。 */
 export function cancelBatchBackfill(): void {
   if (batchState.running) batchState.cancelRequested = true;
 }
@@ -1332,6 +1335,7 @@ export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<Batch
   engineState.lastError = '';
   // 批量状态(模块级单例)→ UI 跨关窗重开可恢复进度/取消
   batchState.running = true;
+  batchState.mode = 'batch';
   batchState.cancelRequested = false;
   batchState.done = 0;
   batchState.total = total;
@@ -1366,11 +1370,86 @@ export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<Batch
     busy = false;
     engineState.running = false;
     batchState.running = false;
+    batchState.mode = null;
     batchState.cancelRequested = false;
   }
   await afterSummaryHideAndInject(chat);
   return { done, total, cancelled };
 }
+
+/**
+ * 逐行补摘:把待摘 AI 楼从旧到新严格串行处理,每楼走完整单楼摘要协议。
+ * 与批量补摘不同,这里保留物品/场景/NPC/计划/地点/主角档案/变量等全部结构化增量。
+ * 后一楼必须等待前一楼落叶并重算派生状态后才发请求,确保它能读取前楼的新状态。
+ * 单楼失败时保留该楼待摘并继续后续;取消在当前楼请求结束后的边界生效。
+ */
+export async function sequentialBackfill(opts: BatchBackfillOpts = {}): Promise<BatchBackfillResult> {
+  if (!engineActiveHere()) return { done: 0, total: 0, cancelled: false };
+  if (busy) return { done: 0, total: 0, cancelled: false };
+  const sender = resolveSender('summary');
+  if ('error' in sender) {
+    engineState.lastError = sender.error;
+    return { done: 0, total: 0, cancelled: false };
+  }
+  const ctx = getContext();
+  if (!ctx) return { done: 0, total: 0, cancelled: false };
+  const chat = ctx.chat ?? [];
+
+  // 启动时冻结并过滤目标:只处理当前仍待摘的 AI 楼,按旧→新排序。
+  const pending = new Set(pendingAiFloors(chat));
+  const floors = (opts.floors ?? [...pending]).filter(f => pending.has(f)).sort((a, b) => a - b);
+  const total = floors.length;
+  if (total === 0) {
+    await afterSummaryHideAndInject(chat);
+    return { done: 0, total: 0, cancelled: false };
+  }
+
+  console.log('[柏宝书] 逐行补摘:', total, '楼,严格串行,', sender.label);
+  busy = true;
+  engineState.running = true;
+  engineState.lastError = '';
+  batchState.running = true;
+  batchState.mode = 'sequential';
+  batchState.cancelRequested = false;
+  batchState.done = 0;
+  batchState.total = total;
+  let done = 0;
+  let cancelled = false;
+  try {
+    for (const floor of floors) {
+      if (batchState.cancelRequested) { cancelled = true; break; }
+      // 楼层可能在排队期间被删除或由其它路径补上;失效目标安全跳过。
+      if (!isAiFloor(chat[floor]) || leafValid(chat[floor])) {
+        done = floors.filter(f => leafValid(chat[f])).length;
+        batchState.done = done;
+        continue;
+      }
+      try {
+        // summarizeFloorWork 内部会在本楼落叶后立刻重算派生状态;
+        // await 保证下一楼构造提示词时已能读取这些新状态。
+        await summarizeFloorWork(chat, floor, sender);
+      } catch (e) {
+        engineState.lastError = e instanceof Error ? e.message : String(e);
+        console.log('[柏宝书] 逐行补摘单楼失败,继续后续:', floor, engineState.lastError);
+      }
+      done = floors.filter(f => leafValid(chat[f])).length;
+      batchState.done = done;
+    }
+    // 全部叶子处理完后再统一连锁生成 L1/L2,避免每楼重复跑总结检测。
+    await checkResummary();
+  } catch (e) {
+    engineState.lastError = e instanceof Error ? e.message : String(e);
+  } finally {
+    busy = false;
+    engineState.running = false;
+    batchState.running = false;
+    batchState.mode = null;
+    batchState.cancelRequested = false;
+  }
+  await afterSummaryHideAndInject(chat);
+  return { done, total, cancelled };
+}
+
 
 /**
  * 当前已被覆盖的楼层索引集合(几何即时推导,不读存储)。
