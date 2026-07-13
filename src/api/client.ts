@@ -236,14 +236,44 @@ export function mainApiAvailable(): boolean {
  * 走 ST 的 generateRaw:只发我们给的这几条消息,不带聊天历史/角色卡;无需连接档。
  * quiet 类型内部强制非流式,返回清洗后的整段文本;失败抛 ApiError。
  */
-export async function requestViaMainApi(messages: ChatMsg[], _opts: RequestOptions = {}): Promise<string> {
+export async function requestViaMainApi(messages: ChatMsg[], opts: RequestOptions = {}): Promise<string> {
   const ctx = getContext();
   if (typeof ctx?.generateRaw !== 'function') {
     throw new ApiError('当前 ST 版本不支持 generateRaw,无法跟随主 API');
   }
-  const content = (await ctx.generateRaw({ prompt: messages, responseLength: MAIN_API_RESPONSE_LENGTH }))?.trim();
-  if (!content) throw new ApiError('主 API 返回空内容');
-  return content;
+
+  const content = await new Promise<string>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      opts.signal?.removeEventListener('abort', onAbort);
+      fn();
+    };
+    const onAbort = () => {
+      // generateRaw 没有 signal 参数，但会监听 ST 的 GENERATION_STOPPED 事件并中止其内部请求。
+      const event = ctx.eventTypes?.GENERATION_STOPPED;
+      if (event && ctx.eventSource?.emit) {
+        try {
+          const emitted = ctx.eventSource.emit(event);
+          if (emitted instanceof Promise) void emitted.catch(() => {});
+        } catch { /* 旧版 ST 不支持 emit 时，至少立即结束插件侧等待。 */ }
+      }
+      finish(() => reject(new ApiError('主 API 请求已取消')));
+    };
+
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    if (opts.signal?.aborted) { onAbort(); return; }
+
+    void ctx.generateRaw!({ prompt: messages, responseLength: MAIN_API_RESPONSE_LENGTH }).then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    );
+  });
+
+  const trimmed = content.trim();
+  if (!trimmed) throw new ApiError('主 API 返回空内容');
+  return trimmed;
 }
 
 /** 连通性测试:发一条极短请求 */

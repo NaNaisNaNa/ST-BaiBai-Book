@@ -60,12 +60,17 @@ export const batchState = reactive({
   mode: null as BackfillMode | null,
   done: 0,
   total: 0,
-  cancelRequested: false, // 用户已点取消、等当前块/当前楼结束后生效
+  cancelRequested: false,
 });
 
-/** 请求取消正在进行的补摘任务(不打断当前块或当前楼的在途请求)。 */
+/** 当前批量/逐行补摘共用的取消控制器；一次运行只允许存在一个。 */
+let backfillAbortController: AbortController | null = null;
+
+/** 立即取消正在进行的补摘请求；当前楼未落叶，已完成楼层保持不变。 */
 export function cancelBatchBackfill(): void {
-  if (batchState.running) batchState.cancelRequested = true;
+  if (!batchState.running) return;
+  batchState.cancelRequested = true;
+  backfillAbortController?.abort();
 }
 
 let busy = false;
@@ -871,17 +876,26 @@ async function syncWindowHiddenState(chat: STMessage[]): Promise<void> {
  *  - 未指派(空)→ 跟随主 API(requestViaMainApi → generateRaw,用主界面当前在用的 API,不带聊天历史)。
  * 主 API 也不可用(ST 无 generateRaw)时返回 error,调用方据此早退并写 lastError。
  */
-function resolveSender(
-  task: TaskType,
-): { send: (messages: ChatMsg[]) => Promise<string>; label: string } | { error: string } {
+interface SummarySender {
+  send: (messages: ChatMsg[], signal?: AbortSignal) => Promise<string>;
+  label: string;
+}
+
+function resolveSender(task: TaskType): SummarySender | { error: string } {
   const channel = getChannelForTask(task);
   if (channel) {
-    return { send: messages => requestCompletion(channel, messages), label: `渠道「${channel.name}」(${channel.model})` };
+    return {
+      send: (messages, signal) => requestCompletion(channel, messages, { signal }),
+      label: `渠道「${channel.name}」(${channel.model})`,
+    };
   }
   if (!mainApiAvailable()) {
     return { error: '未指派副 API 渠道,且当前主 API 不可用(请填好主 API 后重试,或为本任务单独指派渠道)' };
   }
-  return { send: messages => requestViaMainApi(messages), label: '主 API(主界面当前在用)' };
+  return {
+    send: (messages, signal) => requestViaMainApi(messages, { signal }),
+    label: '主 API(主界面当前在用)',
+  };
 }
 
 /**
@@ -890,16 +904,19 @@ function resolveSender(
  * 全部失败则抛出最后一次的错误,由调用方写 lastError。
  */
 async function sendAndParse<T>(
-  send: (messages: ChatMsg[]) => Promise<string>,
+  send: SummarySender['send'],
   messages: ChatMsg[],
   parse: (raw: string) => T,
+  signal?: AbortSignal,
 ): Promise<T> {
   const maxRetries = Math.max(0, apiSettings.summaryMaxRetries | 0);
   let lastErr: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (signal?.aborted) throw new DOMException('补摘请求已取消', 'AbortError');
     try {
-      return parse(await send(messages));
+      return parse(await send(messages, signal));
     } catch (e) {
+      if (signal?.aborted) throw new DOMException('补摘请求已取消', 'AbortError');
       lastErr = e;
       if (attempt < maxRetries) {
         console.log(`[柏宝书] 第 ${attempt + 1} 次尝试失败,重试:`, e instanceof Error ? e.message : String(e));
@@ -921,6 +938,8 @@ interface RunSummaryOptions {
   checkResummary?: boolean;
   /** 内部启动屏障:摘要上下文准备完毕、即将调用 API 时触发。 */
   onRequestStart?: () => void;
+  /** 批量/逐行补摘内部使用：取消当前在途请求。 */
+  signal?: AbortSignal;
 }
 
 export function runSummary(aiFloor: number, options: RunSummaryOptions = {}): Promise<void> {
@@ -1034,8 +1053,8 @@ function applyLeafForFloor(
 async function summarizeFloorWork(
   chat: STMessage[],
   aiFloor: number,
-  sender: { send: (messages: ChatMsg[]) => Promise<string>; label: string },
-  options: Pick<RunSummaryOptions, 'replaceLeaf' | 'onRequestStart'> = {},
+  sender: SummarySender,
+  options: Pick<RunSummaryOptions, 'replaceLeaf' | 'onRequestStart' | 'signal'> = {},
 ): Promise<void> {
   const ctx = getContext();
   if (!ctx) throw new Error('无 ST 上下文');
@@ -1103,7 +1122,7 @@ async function summarizeFloorWork(
       throw new Error(raw.trim() ? '摘要失败:AI道歉或掉格式' : '摘要失败:AI空回');
     }
     return { ...d, summary } as SummaryDelta & { summary: string };
-  });
+  }, options.signal);
 
   applyLeafForFloor(chat, aiFloor, delta, stateBefore, options.replaceLeaf);
   engineState.lastRunAt = Date.now();
@@ -1204,7 +1223,8 @@ export function planBatches(chat: STMessage[], floors: number[], maxChars: numbe
 async function summarizeBatchWork(
   chat: STMessage[],
   block: number[],
-  sender: { send: (messages: ChatMsg[]) => Promise<string>; label: string },
+  sender: SummarySender,
+  signal?: AbortSignal,
 ): Promise<void> {
   const ctx = getContext();
   if (!ctx) throw new Error('无 ST 上下文');
@@ -1273,7 +1293,7 @@ async function summarizeBatchWork(
       throw new Error('批量摘要失败:有楼层缺 summary');
     }
     return cleaned as Array<SummaryDelta & { summary: string }>;
-  });
+  }, signal);
 
   // 逐楼落叶(块内顺序,严格按 block 升序)。批量只取 summary + 起止时间:
   // 显式剥掉 items/plans/location —— 这些跨多楼难保顺序正确(易致计划/时间错乱),
@@ -1303,7 +1323,7 @@ async function summarizeBatchWork(
  *    结构化数据交给后续正常的逐楼自动摘要补。
  *  - 块间串行 + 块内 AI 顺序维护时间单调,后块用前块落盘后的前情。
  *  - 某块解析失败(已含 summaryMaxRetries 次重试)→ 回退:对该块逐楼走单楼摘要(单楼路径仍产完整结构化数据),不中断整体。
- *  - 取消在块边界生效(不打断进行中的块)。
+ *  - 取消会立即中止当前块/当前楼的在途请求，已经成功落叶的楼层保持不变。
  * 全部完成后触发 checkResummary(连锁 L1/L2)+ 收尾(隐藏 + 注入)。
  */
 export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<BatchBackfillResult> {
@@ -1339,39 +1359,47 @@ export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<Batch
   batchState.cancelRequested = false;
   batchState.done = 0;
   batchState.total = total;
+  const abortController = new AbortController();
+  backfillAbortController = abortController;
   let done = 0;
   let cancelled = false;
   try {
     for (const block of batches) {
       if (batchState.cancelRequested) { cancelled = true; break; }
       try {
-        await summarizeBatchWork(chat, block, sender);
+        await summarizeBatchWork(chat, block, sender, abortController.signal);
       } catch (e) {
+        if (abortController.signal.aborted) { cancelled = true; break; }
         // 整块失败(已含重试)→ 回退:逐楼单独摘。单楼也可能失败(写 lastError),失败楼留作待摘,不中断后续。
         console.log('[柏宝书] 批量块失败,回退逐楼:', e instanceof Error ? e.message : String(e));
         for (const f of block) {
+          if (abortController.signal.aborted) { cancelled = true; break; }
           if (!isAiFloor(chat[f]) || leafValid(chat[f])) continue; // 已被填或非 AI 楼:跳过
           try {
-            await summarizeFloorWork(chat, f, sender);
+            await summarizeFloorWork(chat, f, sender, { signal: abortController.signal });
           } catch (e2) {
+            if (abortController.signal.aborted) { cancelled = true; break; }
             engineState.lastError = e2 instanceof Error ? e2.message : String(e2);
           }
         }
       }
+      if (abortController.signal.aborted) { cancelled = true; break; }
       // 本块产出的已落叶楼计入进度(只数确实落上叶子的,失败楼不计)
       done = floors.filter(f => leafValid(chat[f])).length;
       batchState.done = done;
     }
-    // 连锁触发总结(可能跨多层),失败写 lastError 不影响已落叶子
-    await checkResummary();
+    // 主动取消时不再发 L1/L2 请求；正常完成才连锁触发总结。
+    if (!cancelled && !abortController.signal.aborted) await checkResummary(abortController.signal);
   } catch (e) {
-    engineState.lastError = e instanceof Error ? e.message : String(e);
+    if (abortController.signal.aborted) cancelled = true;
+    else engineState.lastError = e instanceof Error ? e.message : String(e);
   } finally {
     busy = false;
     engineState.running = false;
     batchState.running = false;
     batchState.mode = null;
     batchState.cancelRequested = false;
+    if (backfillAbortController === abortController) backfillAbortController = null;
   }
   await afterSummaryHideAndInject(chat);
   return { done, total, cancelled };
@@ -1381,7 +1409,7 @@ export async function batchBackfill(opts: BatchBackfillOpts = {}): Promise<Batch
  * 逐行补摘:把待摘 AI 楼从旧到新严格串行处理,每楼走完整单楼摘要协议。
  * 与批量补摘不同,这里保留物品/场景/NPC/计划/地点/主角档案/变量等全部结构化增量。
  * 后一楼必须等待前一楼落叶并重算派生状态后才发请求,确保它能读取前楼的新状态。
- * 单楼失败时保留该楼待摘并继续后续;取消在当前楼请求结束后的边界生效。
+ * 单楼失败时保留该楼待摘并继续后续；取消会立即中止当前楼的在途请求。
  */
 export async function sequentialBackfill(opts: BatchBackfillOpts = {}): Promise<BatchBackfillResult> {
   if (!engineActiveHere()) return { done: 0, total: 0, cancelled: false };
@@ -1413,6 +1441,8 @@ export async function sequentialBackfill(opts: BatchBackfillOpts = {}): Promise<
   batchState.cancelRequested = false;
   batchState.done = 0;
   batchState.total = total;
+  const abortController = new AbortController();
+  backfillAbortController = abortController;
   let done = 0;
   let cancelled = false;
   try {
@@ -1427,24 +1457,27 @@ export async function sequentialBackfill(opts: BatchBackfillOpts = {}): Promise<
       try {
         // summarizeFloorWork 内部会在本楼落叶后立刻重算派生状态;
         // await 保证下一楼构造提示词时已能读取这些新状态。
-        await summarizeFloorWork(chat, floor, sender);
+        await summarizeFloorWork(chat, floor, sender, { signal: abortController.signal });
       } catch (e) {
+        if (abortController.signal.aborted) { cancelled = true; break; }
         engineState.lastError = e instanceof Error ? e.message : String(e);
         console.log('[柏宝书] 逐行补摘单楼失败,继续后续:', floor, engineState.lastError);
       }
       done = floors.filter(f => leafValid(chat[f])).length;
       batchState.done = done;
     }
-    // 全部叶子处理完后再统一连锁生成 L1/L2,避免每楼重复跑总结检测。
-    await checkResummary();
+    // 主动取消时不再发总结请求；全部叶子正常处理完后才统一连锁生成 L1/L2。
+    if (!cancelled && !abortController.signal.aborted) await checkResummary(abortController.signal);
   } catch (e) {
-    engineState.lastError = e instanceof Error ? e.message : String(e);
+    if (abortController.signal.aborted) cancelled = true;
+    else engineState.lastError = e instanceof Error ? e.message : String(e);
   } finally {
     busy = false;
     engineState.running = false;
     batchState.running = false;
     batchState.mode = null;
     batchState.cancelRequested = false;
+    if (backfillAbortController === abortController) backfillAbortController = null;
   }
   await afterSummaryHideAndInject(chat);
   return { done, total, cancelled };
@@ -1532,18 +1565,20 @@ function rootsAtLevel(level: number, chat: STMessage[]): RootView[] {
  * 用 AI 把这批的**叙事文本**融合成一条上层节点,childIds 收纳它们(底层全部保留)。
  * 一次调用会向上连锁(加叶子→可能生 L1→可能生 L2…),用同一套双阈值递归。
  */
-export async function checkResummary(): Promise<number> {
+export async function checkResummary(signal?: AbortSignal): Promise<number> {
   if (!engineActiveHere()) return 0;
   const ctx = getContext();
   if (!ctx) return 0;
   const chat = ctx.chat ?? [];
 
   let made = 0; // 本次连锁共生成的总结条数
+  if (signal?.aborted) throw new DOMException('总结请求已取消', 'AbortError');
 
   // 最高现存压缩层级,作为连锁上限(+1 容纳新生成的层)
   const maxLevel = memory.summaries.reduce((m, s) => Math.max(m, s.level), 0);
 
   for (let level = 0; level <= maxLevel + 1; level++) {
+    if (signal?.aborted) throw new DOMException('总结请求已取消', 'AbortError');
     const threshold = thresholdForLevel(level);
     if (!threshold || threshold < 2) continue;
 
@@ -1581,7 +1616,7 @@ export async function checkResummary(): Promise<number> {
           throw new Error(raw.trim() ? `${what}失败:AI道歉或掉格式` : `${what}失败:AI空回`);
         }
         return { summary };
-      });
+      }, signal);
 
       // 生成上层节点收纳这批(**不删 batch**),时间戳取批内最新,排在它们之后
       const newCreatedAt = Math.max(...batch.map(s => s.createdAt)) + 1;
@@ -1601,6 +1636,7 @@ export async function checkResummary(): Promise<number> {
       refreshInjection();
       // 不 break:继续外层 for,上一层可能也攒够了 → 连锁压更高层
     } catch (e) {
+      if (signal?.aborted) throw e;
       engineState.lastError = e instanceof Error ? e.message : String(e);
       return made; // 本层失败则停止连锁,下次再试
     }
