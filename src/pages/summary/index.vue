@@ -2,12 +2,13 @@
 import Icon from '@/components/Icon.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import ModalMask from '@/components/ModalMask.vue';
-import { appendOpToLatestLeaf, deleteLeafAt, deleteSummary, editLeafAt, editPlan, editSummary } from '@/memory/apply';
+import { appendOpToLatestLeaf, deleteLeafAt, deleteSummary, deleteSummarySelection, editLeafAt, editPlan, editSummary, type SummaryDeleteMode } from '@/memory/apply';
 import { apiSettings } from '@/api/settings';
 import { batchBackfill, batchState, cancelBatchBackfill, engineState, floorBackfillState, resummarizeNow, summarizeFloor, summarizeSelected } from '@/memory/engine';
 import { refreshInjection, selectViewNodes, type ViewNode } from '@/memory/inject';
 import { compactTimeLabel, formatRange, splitTimeLabel } from '@/memory/timeTag';
 import { relativeTimeLabel, weekdayLabel } from '@/memory/timeRel';
+import { scheduleVectorIndex } from '@/memory/vector';
 import { derivedMeta, memory, recomputeDerived } from '@/memory/store';
 import { getContext } from '@/st/context';
 import { toast } from '@/st/toast';
@@ -421,6 +422,7 @@ function enterSelectMode() {
   expanded.value = new Set(); // 折叠所有展开,只操作根
 }
 function exitSelectMode() {
+  cancelBulkDelete();
   selectMode.value = false;
   selectedIds.value = new Set();
 }
@@ -503,6 +505,75 @@ async function runMerge() {
     }
   } finally {
     merging.value = false;
+  }
+}
+/* ---- 选择模式:批量删除 + 总结处理分支 ---- */
+type BulkDeleteStep = 'idle' | 'first' | 'final';
+const bulkDeleteStep = ref<BulkDeleteStep>('idle');
+const pendingDeleteIds = ref<string[]>([]);
+const pendingDeleteMode = ref<SummaryDeleteMode>('cascade');
+const pendingDeleteLeafCount = ref(0);
+const pendingDeleteSummaryCount = ref(0);
+const bulkDeleting = ref(false);
+
+function cancelBulkDelete() {
+  if (bulkDeleting.value) return;
+  bulkDeleteStep.value = 'idle';
+  pendingDeleteIds.value = [];
+  pendingDeleteMode.value = 'cascade';
+  pendingDeleteLeafCount.value = 0;
+  pendingDeleteSummaryCount.value = 0;
+}
+
+function openBulkDeleteConfirm() {
+  if (!selectionSummary.value.count || bulkDeleting.value || engineState.running) return;
+  const picked = rootNodes.value.filter(node => selectedIds.value.has(node.id));
+  if (!picked.length) return;
+  // 冻结确认目标:弹窗期间即使列表响应其它事件变化,最终操作仍只认这份快照。
+  pendingDeleteIds.value = picked.map(node => node.id);
+  pendingDeleteLeafCount.value = picked.filter(node => node.kind === 'leaf').length;
+  pendingDeleteSummaryCount.value = picked.filter(node => node.kind === 'comp').length;
+  pendingDeleteMode.value = 'cascade';
+  bulkDeleteStep.value = 'first';
+}
+
+function chooseBulkDeleteMode(mode: SummaryDeleteMode) {
+  if (bulkDeleting.value) return;
+  if (engineState.running) {
+    toast('摘要引擎正在运行,请稍后再删除。', 'warning');
+    return;
+  }
+  pendingDeleteMode.value = mode;
+  bulkDeleteStep.value = 'final';
+}
+
+function closeFinalDeleteDialog(open: boolean) {
+  if (!open) cancelBulkDelete();
+}
+
+function runBulkDelete() {
+  if (bulkDeleting.value || bulkDeleteStep.value !== 'final') return;
+  if (engineState.running) {
+    toast('摘要引擎正在运行,请稍后再删除。', 'warning');
+    return;
+  }
+  bulkDeleting.value = true;
+  try {
+    const result = deleteSummarySelection(pendingDeleteIds.value, pendingDeleteMode.value);
+    if (!result.deletedLeaves && !result.deletedSummaries) {
+      toast('所选摘要已经失效或不存在,没有删除任何内容。', 'warning');
+      bulkDeleting.value = false;
+      cancelBulkDelete();
+      return;
+    }
+    if (result.deletedLeaves > 0) scheduleVectorIndex();
+    refreshInjection();
+    toast(`已删除 ${result.deletedLeaves} 条摘要${result.deletedSummaries ? `、${result.deletedSummaries} 条总结` : ''}。`, 'success');
+    // 成功后退出选择态;exitSelectMode 会同时清掉确认快照。
+    bulkDeleting.value = false;
+    exitSelectMode();
+  } finally {
+    bulkDeleting.value = false;
   }
 }
 
@@ -672,7 +743,7 @@ provide(SUMMARY_CTX, {
           class="bbs-btn bbs-btn-sm"
           type="button"
           :disabled="!rootNodes.length || searching"
-          title="勾选连续的多条摘要,手动合并成一条总结"
+          title="勾选多条摘要可批量删除;连续选择时也可合并总结"
           @click="enterSelectMode"
         >
           <Icon name="checklist" /><span class="bbs-btn-label">多选</span>
@@ -882,7 +953,7 @@ provide(SUMMARY_CTX, {
           </template>
           · 生成 {{ levelLabel(selectionSummary.level) }}
         </template>
-        <template v-else>勾选连续的多条摘要合并</template>
+        <template v-else>勾选摘要后可批量删除;连续多条还可合并</template>
       </span>
       <span v-if="selectionSummary.count >= 2 && !canMerge" class="bbs-select-warn">需选连续的摘要</span>
       <!-- 全选/取消全选:列表长时免逐条点;文案随 allSelected 切换 -->
@@ -894,6 +965,16 @@ provide(SUMMARY_CTX, {
         @click="toggleSelectAll"
       >
         {{ allSelected ? '取消全选' : '全选' }}
+      </button>
+      <button
+        class="bbs-btn bbs-btn-sm bbs-bulk-delete-btn"
+        type="button"
+        :disabled="!selectionSummary.count || bulkDeleting || engineState.running"
+        title="永久删除所选摘要"
+        @click="openBulkDeleteConfirm"
+      >
+        <Icon name="trash" />
+        批量删除
       </button>
       <button
         class="bbs-btn bbs-btn-sm bbs-btn-primary"
@@ -916,6 +997,63 @@ provide(SUMMARY_CTX, {
     >
       将把选中的 {{ selectionSummary.count }} 条摘要合并成一条 {{ levelLabel(selectionSummary.level) }}(无视自动总结阈值)。
       原摘要会被收纳进新总结、从列表收起(数据不删,可删掉新总结还原)。继续?
+    </ConfirmDialog>
+    <!-- 批量删除第一层确认:含总结时在这里选择「连下层删 / 只拆外壳」 -->
+    <ModalMask :open="bulkDeleteStep === 'first'" @close="cancelBulkDelete">
+      <div class="bbs-modal bbs-bulk-delete-modal" role="dialog" aria-modal="true" aria-label="批量删除摘要">
+        <header class="bbs-modal-head">
+          <span class="bbs-modal-title">批量删除摘要</span>
+        </header>
+        <p class="bbs-bulk-delete-text">你将会删除你所选的摘要，此操作不可逆，确定吗</p>
+        <p v-if="pendingDeleteSummaryCount" class="bbs-bulk-delete-note">
+          选中内容中包含 {{ pendingDeleteSummaryCount }} 条总结。请选择是连同总结收纳的下层摘要一起删除，还是只删除总结并释放下层摘要。
+        </p>
+        <footer class="bbs-modal-foot bbs-bulk-delete-foot">
+          <button class="bbs-btn" type="button" :disabled="bulkDeleting" @click="cancelBulkDelete">取消</button>
+          <button
+            v-if="pendingDeleteSummaryCount"
+            class="bbs-btn bbs-bulk-unwrap-btn"
+            type="button"
+            :disabled="bulkDeleting || engineState.running"
+            @click="chooseBulkDeleteMode('unwrap')"
+          >
+            删除总结，释放下层摘要
+          </button>
+          <button
+            class="bbs-btn bbs-bulk-cascade-btn"
+            type="button"
+            :disabled="bulkDeleting || engineState.running"
+            @click="chooseBulkDeleteMode('cascade')"
+          >
+            <Icon name="trash" />
+            {{ pendingDeleteSummaryCount ? '连同总结下的摘要一起删除' : '确定' }}
+          </button>
+        </footer>
+      </div>
+    </ModalMask>
+
+    <!-- 批量删除第二层最终确认 -->
+    <ConfirmDialog
+      :open="bulkDeleteStep === 'final'"
+      title="最终确认"
+      cancelText="取消"
+      confirmText="我很清楚我在做什么，确定"
+      confirmIcon="trash"
+      tone="danger"
+      :busy="bulkDeleting"
+      busyText="删除中…"
+      @update:open="closeFinalDeleteDialog"
+      @confirm="runBulkDelete"
+    >
+      <template v-if="pendingDeleteMode === 'cascade'">
+        你真的确定吗，删除所选摘要之后，摘要里的物品，场景，角色都会被一并删除
+      </template>
+      <template v-else-if="pendingDeleteLeafCount">
+        你真的确定吗？所选普通摘要及其中的物品、场景、角色会被一并删除；所选总结只会删除总结本身并释放下层摘要，下层摘要中的内容会保留。
+      </template>
+      <template v-else>
+        你真的确定吗？所选总结将被删除并释放下层摘要；下层摘要及其中的物品、场景、角色不会被删除。
+      </template>
     </ConfirmDialog>
 
     <!-- ===== 添加计划 / 悬念弹窗 ===== -->
@@ -1610,6 +1748,51 @@ provide(SUMMARY_CTX, {
   width: 12px;
   height: 12px;
 }
+/* 批量删除:操作条危险按钮 + 第一层分支弹窗 */
+.bbs-bulk-delete-btn,
+.bbs-bulk-cascade-btn {
+  color: var(--bbs-danger);
+  border-color: var(--bbs-line-strong);
+}
+.bbs-bulk-delete-btn:hover:not(:disabled),
+.bbs-bulk-cascade-btn:hover:not(:disabled) {
+  color: var(--bbs-danger);
+  border-color: var(--bbs-danger);
+  background: var(--bbs-danger-soft);
+}
+.bbs-bulk-delete-modal {
+  max-width: 540px;
+}
+.bbs-bulk-delete-text {
+  margin: 4px 0 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--bbs-ink-soft);
+}
+.bbs-bulk-delete-note {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--bbs-warning);
+  border-radius: var(--bbs-radius-sm);
+  background: var(--bbs-warning-soft);
+  color: var(--bbs-ink);
+  font-size: 12px;
+  line-height: 1.65;
+}
+.bbs-bulk-delete-foot {
+  flex-wrap: wrap;
+}
+.bbs-bulk-delete-foot .bbs-btn {
+  justify-content: center;
+  max-width: 100%;
+  white-space: normal;
+  text-align: center;
+}
+.bbs-bulk-unwrap-btn:hover:not(:disabled) {
+  border-color: var(--bbs-accent);
+  color: var(--bbs-accent);
+  background: var(--bbs-accent-soft);
+}
 
 .bbs-empty {
   flex: 1;
@@ -1646,6 +1829,10 @@ provide(SUMMARY_CTX, {
 
 /* ============ 窄屏:类型切换撑满、状态条整齐 ============ */
 @media (max-width: 640px) {
+  /* 删除分支文案较长:窄屏下一行一个按钮,避免挤压或误触。 */
+  .bbs-bulk-delete-foot .bbs-btn {
+    flex: 1 1 100%;
+  }
   /* 添加弹窗里的类型切换:计划 | 悬念 各占一半,撑满整行 */
   .bbs-kind-toggle {
     width: 100%;

@@ -105,8 +105,17 @@ function confirm() {
   line-height: 1.7;
   color: var(--bbs-ink-soft);
 }
+.bbs-modal-foot {
+  flex-wrap: wrap;
+}
 .bbs-modal-foot-spacer {
   flex: 1 1 auto;
+}
+.bbs-modal-foot .bbs-btn {
+  justify-content: center;
+  max-width: 100%;
+  white-space: normal;
+  text-align: center;
 }
 /* 危险操作按钮:描边低调,hover 才显红,避免误触 */
 .bbs-btn-danger {
@@ -117,5 +126,13 @@ function confirm() {
   color: var(--bbs-danger);
   border-color: var(--bbs-danger);
   background: var(--bbs-danger-soft);
+}
+@media (max-width: 480px) {
+  .bbs-modal-foot-spacer {
+    display: none;
+  }
+  .bbs-modal-foot .bbs-btn:last-child {
+    flex: 1 1 100%;
+  }
 }
 </style>

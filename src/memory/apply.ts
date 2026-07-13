@@ -1924,6 +1924,94 @@ export function deleteSummary(id: string): boolean {
   return true;
 }
 
+export type SummaryDeleteMode = 'cascade' | 'unwrap';
+
+export interface SummaryDeleteResult {
+  deletedLeaves: number;
+  deletedSummaries: number;
+}
+
+/**
+ * 摘要页多选删除。直接选中的叶子始终删除;选中的压缩总结按 mode 处理:
+ *  - cascade:递归删除整棵总结子树及其全部后代叶子;
+ *  - unwrap:只删除选中的总结外壳,其直接子节点因引用断开重新成为根。
+ *
+ * 所有目标先按 id 快照解析、去重,再一次性变更;叶子只重算/落盘一次。
+ */
+export function deleteSummarySelection(ids: readonly string[], mode: SummaryDeleteMode): SummaryDeleteResult {
+  const chat = getContext()?.chat;
+  const empty: SummaryDeleteResult = { deletedLeaves: 0, deletedSummaries: 0 };
+  if (!chat || !ids.length) return empty;
+
+  const selectedIds = new Set(ids.filter((id): id is string => typeof id === 'string' && !!id));
+  if (!selectedIds.size) return empty;
+
+  const leafIndexById = new Map<string, number>();
+  for (let i = 0; i < chat.length; i++) {
+    const leaf = getLeaf(chat[i]);
+    if (leaf?.id) leafIndexById.set(leaf.id, i);
+  }
+  const summaryById = new Map(memory.summaries.map(summary => [summary.id, summary]));
+  const leafIds = new Set<string>();
+  const summaryIds = new Set<string>();
+  const visited = new Set<string>();
+
+  const collectCascade = (id: string): void => {
+    if (visited.has(id)) return;
+    visited.add(id);
+    const summary = summaryById.get(id);
+    if (!summary) {
+      if (leafIndexById.has(id)) leafIds.add(id);
+      return;
+    }
+    summaryIds.add(id);
+    for (const childId of summary.childIds) collectCascade(childId);
+  };
+
+  for (const id of selectedIds) {
+    const summary = summaryById.get(id);
+    if (summary) {
+      if (mode === 'cascade') collectCascade(id);
+      else summaryIds.add(id);
+    } else if (leafIndexById.has(id)) {
+      leafIds.add(id);
+    }
+  }
+
+  let deletedLeaves = 0;
+  for (const leafId of leafIds) {
+    const index = leafIndexById.get(leafId);
+    if (index === undefined || !chat[index]?.extra?.bbs_leaf) continue;
+    delete (chat[index].extra as Record<string, unknown>).bbs_leaf;
+    deletedLeaves += 1;
+  }
+
+  const summariesBefore = memory.summaries.length;
+  if (summaryIds.size) {
+    // 同 deleteSummary:先从仍保留的父节点中摘除目标引用,再移除目标节点。
+    for (const parent of memory.summaries) {
+      if (summaryIds.has(parent.id)) continue;
+      if (parent.childIds.some(id => summaryIds.has(id))) {
+        parent.childIds = parent.childIds.filter(id => !summaryIds.has(id));
+      }
+    }
+    memory.summaries = memory.summaries.filter(summary => !summaryIds.has(summary.id));
+  }
+
+  if (!deletedLeaves && memory.summaries.length === summariesBefore) return empty;
+
+  if (deletedLeaves) {
+    recomputeDerived();
+    // 删除叶子后统一清除所有悬空/损坏的祖先总结;批量入口最后统一 saveMemory。
+    pruneBrokenCompsInternal(false);
+    scheduleLeafFlush();
+  }
+  const deletedSummaries = summariesBefore - memory.summaries.length;
+  if (deletedSummaries > 0) saveMemory();
+
+  return { deletedLeaves, deletedSummaries };
+}
+
 /**
  * 删除递归包含某个子节点的全部祖先压缩节点。
  *
@@ -1961,7 +2049,7 @@ export function invalidateSummaryAncestors(childId: string): number {
  * 翻页到没摘过的 swipe 时,被压缩进 L1 的叶子虽对当前页 leafValid=false,但它仍物理存在于
  * 自己那一页的 extra 里(翻回去就显示)——绝不能因「当前不在这页」就删掉它所属的压缩链。
  */
-export function pruneBrokenComps(): boolean {
+function pruneBrokenCompsInternal(persist: boolean): boolean {
   const chat = getContext()?.chat ?? null;
   const liveLeafIds = new Set<string>();
   if (chat) {
@@ -1993,8 +2081,12 @@ export function pruneBrokenComps(): boolean {
   const before = memory.summaries.length;
   memory.summaries = memory.summaries.filter(s => isIntact(s.id, new Set()));
   const changed = memory.summaries.length !== before;
-  if (changed) saveMemory();
+  if (changed && persist) saveMemory();
   return changed;
+}
+
+export function pruneBrokenComps(): boolean {
+  return pruneBrokenCompsInternal(true);
 }
 
 /** 测试辅助:重置 id 序列 */
